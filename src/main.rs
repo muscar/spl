@@ -36,8 +36,8 @@ enum BinOp {
     Minus,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Token {
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum TokenKind {
     IntLit,
     Ident,
     Plus,
@@ -53,6 +53,11 @@ enum Token {
     KwEnd,
     Unknown,
     Eof,
+}
+
+struct Token {
+    kind: TokenKind,
+    text: String,
 }
 
 struct SourceReader<'a> {
@@ -77,81 +82,83 @@ impl<'a> SourceReader<'a> {
 
 struct Tokens<'a> {
     reader: &'a mut SourceReader<'a>,
-    lexeme: String,
+    keywords: HashMap<&'static str, TokenKind>,
 }
 
 impl<'a> Tokens<'a> {
-    fn new(reader: &'a mut SourceReader<'a>) -> Self {
-        Self {
-            reader,
-            lexeme: String::new(),
-        }
+    fn new(reader: &'a mut SourceReader<'a>, keywords: HashMap<&'static str, TokenKind>) -> Self {
+        Self { reader, keywords }
     }
 }
 
 impl<'a> Iterator for Tokens<'a> {
-    type Item = (Token, String);
+    type Item = Token;
 
     fn next(&mut self) -> Option<Self::Item> {
         while matches!(self.reader.peek(), Some(c) if c.is_whitespace()) {
             self.reader.read();
         }
-        self.lexeme.clear();
-        match self.reader.peek() {
+        let mut token = Token {
+            kind: TokenKind::Eof,
+            text: String::new(),
+        };
+        token.kind = match self.reader.peek() {
             Some('+') => {
-                self.lexeme.push(self.reader.read().unwrap());
-                Some((Token::Plus, self.lexeme.clone()))
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Plus
             }
             Some('-') => {
-                self.lexeme.push(self.reader.read().unwrap());
-                Some((Token::Minus, self.lexeme.clone()))
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Minus
             }
             Some(',') => {
-                self.lexeme.push(self.reader.read().unwrap());
-                Some((Token::Comma, self.lexeme.clone()))
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Comma
             }
             Some('.') => {
-                self.lexeme.push(self.reader.read().unwrap());
-                Some((Token::Period, self.lexeme.clone()))
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Period
             }
             Some(';') => {
-                self.lexeme.push(self.reader.read().unwrap());
-                Some((Token::Semicolon, self.lexeme.clone()))
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Semicolon
             }
             Some(':') => {
-                self.lexeme.push(self.reader.read().unwrap());
+                token.text.push(self.reader.read().unwrap());
                 if self.reader.peek() == Some('=') {
-                    self.lexeme.push(self.reader.read().unwrap());
-                    return Some((Token::Becomes, self.lexeme.clone()));
+                    token.text.push(self.reader.read().unwrap());
+                    TokenKind::Becomes
+                } else {
+                    TokenKind::Colon
                 }
-                Some((Token::Colon, self.lexeme.clone()))
             }
             Some(c) if c.is_digit(10) => {
                 while matches!(self.reader.peek(), Some(c) if c.is_digit(10)) {
-                    self.lexeme.push(self.reader.read().unwrap());
+                    token.text.push(self.reader.read().unwrap());
                 }
-                Some((Token::IntLit, self.lexeme.clone()))
+                TokenKind::IntLit
             }
             Some(c) if c.is_alphanumeric() => {
                 while matches!(self.reader.peek(), Some(c) if c.is_alphanumeric()) {
-                    self.lexeme.push(self.reader.read().unwrap());
+                    token.text.push(self.reader.read().unwrap());
                 }
-                match &self.lexeme[..] {
-                    "integer" => Some((Token::KwInteger, self.lexeme.clone())),
-                    "string" => Some((Token::KwString, self.lexeme.clone())),
-                    "begin" => Some((Token::KwBegin, self.lexeme.clone())),
-                    "end" => Some((Token::KwEnd, self.lexeme.clone())),
-                    _ => Some((Token::Ident, self.lexeme.clone())),
-                }
+                self.keywords
+                    .get(&token.text[..])
+                    .cloned()
+                    .unwrap_or(TokenKind::Ident)
             }
             Some(_) => {
                 while matches!(self.reader.peek(), Some(c) if !c.is_whitespace()) {
-                    self.lexeme.push(self.reader.read().unwrap());
+                    token.text.push(self.reader.read().unwrap());
                 }
-                Some((Token::Unknown, self.lexeme.clone()))
+                TokenKind::Unknown
             }
-            None => Some((Token::Eof, "end of file".to_string())),
-        }
+            None => {
+                token.text = "end of file".to_string();
+                TokenKind::Eof
+            }
+        };
+        Some(token)
     }
 }
 
@@ -165,7 +172,12 @@ impl<'a> Scanner<'a> {
     }
 
     fn scan(&'a mut self) -> Tokens<'a> {
-        Tokens::new(&mut self.reader)
+        let mut keywords = HashMap::new();
+        keywords.insert("integer", TokenKind::KwInteger);
+        keywords.insert("string", TokenKind::KwString);
+        keywords.insert("begin", TokenKind::KwBegin);
+        keywords.insert("end", TokenKind::KwEnd);
+        Tokens::new(&mut self.reader, keywords)
     }
 }
 
@@ -180,24 +192,24 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect(&mut self, expected: Token) -> String {
+    fn expect(&mut self, expected: TokenKind) -> String {
         match self.tokens.next() {
-            Some((tok, lex)) if tok == expected => lex,
-            Some((tok, lex)) => panic!(
+            Some(tok) if tok.kind == expected => tok.text,
+            Some(tok) => panic!(
                 "syntactic error: expecting {:?}, got {:?} (`{}')",
-                expected, tok, lex
+                expected, tok.kind, tok.text
             ),
             _ => panic!(),
         }
     }
 
     fn ident(&mut self) -> Ident {
-        Ident(self.expect(Token::Ident))
+        Ident(self.expect(TokenKind::Ident))
     }
 
     fn ident_list(&mut self) -> Vec<Ident> {
         let mut idents = vec![self.ident()];
-        while matches!(self.tokens.peek(), Some((Token::Comma, _))) {
+        while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Comma) {
             self.tokens.next();
             idents.push(self.ident());
         }
@@ -210,33 +222,33 @@ impl<'a> Parser<'a> {
 
     fn program(&mut self) -> Block {
         let expr = self.block();
-        self.expect(Token::Period);
+        self.expect(TokenKind::Period);
         expr
     }
 
     fn block(&mut self) -> Block {
         let mut declarations = vec![];
-        self.expect(Token::KwBegin);
+        self.expect(TokenKind::KwBegin);
         while matches!(
             self.tokens.peek(),
-            Some((Token::KwInteger, _)) | Some((Token::KwString, _))
+            Some(tok) if tok.kind == TokenKind::KwInteger || tok.kind == TokenKind::KwString
         ) {
-            let ty_name = TypeName(self.tokens.next().unwrap().1);
+            let ty_name = TypeName(self.tokens.next().unwrap().text);
             declarations.push((ty_name, self.ident_list()));
-            self.expect(Token::Semicolon);
+            self.expect(TokenKind::Semicolon);
         }
         let mut body = vec![self.statement()];
-        while matches!(self.tokens.peek(), Some((Token::Semicolon, _))) {
+        while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Semicolon) {
             self.tokens.next();
             body.push(self.statement());
         }
-        self.expect(Token::KwEnd);
+        self.expect(TokenKind::KwEnd);
         Block { declarations, body }
     }
 
     fn statement(&mut self) -> Stmt {
         let lhs = self.simple_expr();
-        if matches!(self.tokens.peek(), Some((Token::Becomes, _))) {
+        if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
             self.tokens.next();
             let rhs = self.simple_expr();
             return Stmt::Assign(Box::new(lhs), Box::new(rhs));
@@ -248,11 +260,11 @@ impl<'a> Parser<'a> {
         let mut lhs = self.factor();
         while matches!(
             self.tokens.peek(),
-            Some((Token::Plus, _)) | Some((Token::Minus, _))
+            Some(tok) if tok.kind == TokenKind::Plus || tok.kind == TokenKind::Minus
         ) {
             let op = match self.tokens.next() {
-                Some((Token::Plus, _)) => BinOp::Plus,
-                Some((Token::Minus, _)) => BinOp::Minus,
+                Some(tok) if tok.kind == TokenKind::Plus => BinOp::Plus,
+                Some(tok) if tok.kind == TokenKind::Minus => BinOp::Minus,
                 _ => panic!(),
             };
             lhs = Expr::BinOp(op, Box::new(lhs), Box::new(self.factor()));
@@ -265,10 +277,10 @@ impl<'a> Parser<'a> {
     }
 
     fn factor(&mut self) -> Expr {
-        let (tok, lex) = self.tokens.next().expect("expecting factor");
-        match tok {
-            Token::IntLit => Expr::IntLit(lex.parse().expect("malformed integer literal")),
-            Token::Ident => Expr::Ident(Ident(lex.clone())),
+        let tok = self.tokens.next().expect("expecting factor");
+        match tok.kind {
+            TokenKind::IntLit => Expr::IntLit(tok.text.parse().expect("malformed integer literal")),
+            TokenKind::Ident => Expr::Ident(Ident(tok.text)),
             _ => panic!("sytactic error: expecting factor"),
         }
     }
@@ -388,7 +400,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeGen, names: &mut HashMap<Ident, Local
         Stmt::Assign(lhs, rhs) => match &**lhs {
             Expr::Ident(id) => {
                 let idx = names
-                    .get(&id)
+                    .get(id)
                     .expect(&format!("unbound identifier: {}", id.0));
                 compile_expr(rhs, gen, names);
                 gen.emit(OpCode::StLoc(*idx))
