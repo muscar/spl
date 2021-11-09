@@ -5,6 +5,8 @@ use std::{
     str::Chars,
 };
 
+// AST
+
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 struct Ident(String);
 
@@ -35,6 +37,8 @@ enum BinOp {
     Plus,
     Minus,
 }
+
+// Scanner
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum TokenKind {
@@ -181,6 +185,8 @@ impl<'a> Scanner<'a> {
     }
 }
 
+// Parser
+
 struct Parser<'a> {
     tokens: Peekable<Tokens<'a>>,
 }
@@ -286,6 +292,69 @@ impl<'a> Parser<'a> {
     }
 }
 
+// Semantic
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Type {
+    Integer,
+    String,
+}
+
+fn resolve_type(name: &str) -> Type {
+    match name {
+        "integer" => Type::Integer,
+        "string" => Type::String,
+        _ => panic!("type error: unknown type {}", name),
+    }
+}
+
+fn type_check_block(ty_env: &mut HashMap<Ident, Type>, block: &Block) {
+    for (ty_name, ids) in &block.declarations {
+        let ty = resolve_type(&ty_name.0);
+        for id in ids {
+            ty_env.insert(id.clone(), ty);
+        }
+    }
+    for stmt in &block.body {
+        type_check_stmt(ty_env, stmt);
+    }
+}
+
+fn type_check_stmt(ty_env: &HashMap<Ident, Type>, stmt: &Stmt) {
+    match stmt {
+        Stmt::Expr(e) => {
+            type_of_expr(ty_env, e);
+        }
+        Stmt::Assign(lhs, rhs) => {
+            let lty = type_of_expr(ty_env, lhs);
+            let rty = type_of_expr(ty_env, rhs);
+            if rty != lty {
+                panic!("type error: trying to assign {:?} to {:?}", rty, lty);
+            }
+        }
+    };
+}
+
+fn type_of_expr(ty_env: &HashMap<Ident, Type>, expr: &Expr) -> Type {
+    match expr {
+        Expr::IntLit(_) => Type::Integer,
+        Expr::Ident(id) => ty_env
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| panic!("unbound identifier `{}'", id.0)),
+        Expr::BinOp(op, lhs, rhs) => {
+            let lty = type_of_expr(ty_env, lhs);
+            let rty = type_of_expr(ty_env, rhs);
+            match (lty, rty) {
+                (Type::Integer, Type::Integer) => Type::Integer,
+                _ => panic!("type error: operator {:?} must have integer operands", op),
+            }
+        }
+    }
+}
+
+// Compiler + VM
+
 #[derive(Debug, Clone, Copy)]
 struct LocalIdx(usize);
 
@@ -299,12 +368,12 @@ enum OpCode {
     Ret,
 }
 
-struct CodeGen {
+struct CodeBlock {
     code: Vec<OpCode>,
     next_local_idx: usize,
 }
 
-impl CodeGen {
+impl CodeBlock {
     fn new() -> Self {
         Self {
             code: Vec::new(),
@@ -348,7 +417,7 @@ impl Vm {
         }
     }
 
-    fn run(&mut self, gen: &CodeGen) -> i64 {
+    fn run(&mut self, gen: &CodeBlock) -> i64 {
         self.call_stack
             .push(ActivationRecord::new(gen.next_local_idx));
         for op in &gen.code {
@@ -379,10 +448,16 @@ impl Vm {
     }
 }
 
-fn compile_block(block: &Block, gen: &mut CodeGen) {
+#[derive(Debug)]
+enum Item {
+    Imm,
+    Local(LocalIdx),
+}
+
+fn compile_block(block: &Block, gen: &mut CodeBlock) {
     let mut names = HashMap::new();
-    for (_, idx) in &block.declarations {
-        for id in idx {
+    for (_, ids) in &block.declarations {
+        for id in ids {
             let idx = gen.add_local();
             names.insert(id.clone(), idx);
             // gen.emit(OpCode::LdcI8(0));
@@ -394,40 +469,45 @@ fn compile_block(block: &Block, gen: &mut CodeGen) {
     }
 }
 
-fn compile_stmt(stmt: &Stmt, gen: &mut CodeGen, names: &mut HashMap<Ident, LocalIdx>) {
+fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, LocalIdx>) {
     match stmt {
-        Stmt::Expr(e) => compile_expr(e, gen, names),
-        Stmt::Assign(lhs, rhs) => match &**lhs {
-            Expr::Ident(id) => {
-                let idx = names
-                    .get(id)
-                    .expect(&format!("unbound identifier: {}", id.0));
+        Stmt::Expr(e) => {
+            compile_expr(e, gen, names);
+        }
+        Stmt::Assign(lhs, rhs) => match compile_expr(lhs, gen, names) {
+            Item::Imm => panic!("trying to assign to value on stack! bug?"),
+            Item::Local(idx) => {
                 compile_expr(rhs, gen, names);
-                gen.emit(OpCode::StLoc(*idx))
+                gen.emit(OpCode::StLoc(idx));
             }
-            _ => panic!("general assignment is not implemented"),
         },
     }
 }
 
-fn compile_expr(expr: &Expr, gen: &mut CodeGen, names: &HashMap<Ident, LocalIdx>) {
+fn compile_expr(expr: &Expr, gen: &mut CodeBlock, names: &HashMap<Ident, LocalIdx>) -> Item {
     match expr {
-        Expr::IntLit(n) => gen.emit(OpCode::LdcI8(*n)),
+        Expr::IntLit(n) => {
+            gen.emit(OpCode::LdcI8(*n));
+            Item::Imm
+        }
         Expr::Ident(id) => {
             let idx = names
                 .get(id)
                 .expect(&format!("unbound identifier: {}", id.0));
             gen.emit(OpCode::LdLoc(*idx));
+            Item::Local(*idx)
         }
         Expr::BinOp(BinOp::Plus, lhs, rhs) => {
             compile_expr(lhs, gen, names);
             compile_expr(rhs, gen, names);
             gen.emit(OpCode::Add);
+            Item::Imm
         }
         Expr::BinOp(BinOp::Minus, lhs, rhs) => {
             compile_expr(lhs, gen, names);
             compile_expr(rhs, gen, names);
             gen.emit(OpCode::Sub);
+            Item::Imm
         }
     }
 }
@@ -446,7 +526,10 @@ fn main() {
         let node = p.parse();
         println!("; {:?}", node);
 
-        let mut gen = CodeGen::new();
+        let mut ty_env = HashMap::new();
+        type_check_block(&mut ty_env, &node);
+
+        let mut gen = CodeBlock::new();
         compile_block(&node, &mut gen);
         let mut vm = Vm::new();
         println!("; {:?} ; compile", vm.run(&gen));
