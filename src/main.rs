@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     io::{self, Write},
     iter::Peekable,
     str::Chars,
@@ -358,7 +359,6 @@ fn type_of_expr(ty_env: &HashMap<Ident, Type>, expr: &Expr) -> Type {
 #[derive(Debug, Clone, Copy)]
 struct LocalIdx(usize);
 
-#[derive(Debug)]
 enum OpCode {
     LdcI8(i64),
     LdLoc(LocalIdx),
@@ -366,6 +366,19 @@ enum OpCode {
     Add,
     Sub,
     Ret,
+}
+
+impl Display for OpCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpCode::LdcI8(n) => f.write_fmt(format_args!("ldc.i8 {}", n)),
+            OpCode::LdLoc(idx) => f.write_fmt(format_args!("ldloc {}", idx.0)),
+            OpCode::StLoc(idx) => f.write_fmt(format_args!("stloc {}", idx.0)),
+            OpCode::Add => f.write_str("add"),
+            OpCode::Sub => f.write_str("sub"),
+            OpCode::Ret => f.write_str("ret"),
+        }
+    }
 }
 
 struct CodeBlock {
@@ -448,9 +461,10 @@ impl Vm {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Item {
-    Imm,
+    Imm(i64),
+    Stack,
     Local(LocalIdx),
 }
 
@@ -472,12 +486,14 @@ fn compile_block(block: &Block, gen: &mut CodeBlock) {
 fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, LocalIdx>) {
     match stmt {
         Stmt::Expr(e) => {
-            compile_expr(e, gen, names);
+            let item = compile_expr(e, gen, names);
+            load(gen, item);
         }
         Stmt::Assign(lhs, rhs) => match compile_expr(lhs, gen, names) {
-            Item::Imm => panic!("trying to assign to value on stack! bug?"),
+            Item::Imm(_) | Item::Stack => panic!("trying to assign to value on stack! bug?"),
             Item::Local(idx) => {
-                compile_expr(rhs, gen, names);
+                let item = compile_expr(rhs, gen, names);
+                load(gen, item);
                 gen.emit(OpCode::StLoc(idx));
             }
         },
@@ -487,28 +503,43 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Loc
 fn compile_expr(expr: &Expr, gen: &mut CodeBlock, names: &HashMap<Ident, LocalIdx>) -> Item {
     match expr {
         Expr::IntLit(n) => {
-            gen.emit(OpCode::LdcI8(*n));
-            Item::Imm
+            // gen.emit(OpCode::LdcI8(*n));
+            Item::Imm(*n)
         }
         Expr::Ident(id) => {
             let idx = names
                 .get(id)
-                .expect(&format!("unbound identifier: {}", id.0));
-            gen.emit(OpCode::LdLoc(*idx));
+                .unwrap_or_else(|| panic!("unbound identifier: {}", id.0));
+            // gen.emit(OpCode::LdLoc(*idx));
             Item::Local(*idx)
         }
-        Expr::BinOp(BinOp::Plus, lhs, rhs) => {
-            compile_expr(lhs, gen, names);
-            compile_expr(rhs, gen, names);
-            gen.emit(OpCode::Add);
-            Item::Imm
+        Expr::BinOp(op, lhs, rhs) => {
+            let litem = compile_expr(lhs, gen, names);
+            let ritem = compile_expr(rhs, gen, names);
+            match (litem, ritem) {
+                (Item::Imm(m), Item::Imm(n)) => match op {
+                    BinOp::Plus => Item::Imm(m + n),
+                    BinOp::Minus => Item::Imm(m - n),
+                },
+                _ => {
+                    load(gen, litem);
+                    load(gen, ritem);
+                    match op {
+                        BinOp::Plus => gen.emit(OpCode::Add),
+                        BinOp::Minus => gen.emit(OpCode::Sub),
+                    }
+                    Item::Stack
+                }
+            }
         }
-        Expr::BinOp(BinOp::Minus, lhs, rhs) => {
-            compile_expr(lhs, gen, names);
-            compile_expr(rhs, gen, names);
-            gen.emit(OpCode::Sub);
-            Item::Imm
-        }
+    }
+}
+
+fn load(gen: &mut CodeBlock, item: Item) {
+    match item {
+        Item::Imm(n) => gen.emit(OpCode::LdcI8(n)),
+        Item::Local(idx) => gen.emit(OpCode::LdLoc(idx)),
+        Item::Stack => (),
     }
 }
 
@@ -531,8 +562,13 @@ fn main() {
 
         let mut gen = CodeBlock::new();
         compile_block(&node, &mut gen);
+        println!("; code:");
+        for op in &gen.code {
+            println!(";   {}", op);
+        }
+
         let mut vm = Vm::new();
-        println!("; {:?} ; compile", vm.run(&gen));
+        println!("; {:?}", vm.run(&gen));
 
         buf.clear();
     }
