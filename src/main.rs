@@ -24,10 +24,12 @@ struct Block {
 enum Stmt {
     Expr(Box<Expr>),
     Assign(Box<Expr>, Box<Expr>),
+    If(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
 }
 
 #[derive(Debug)]
 enum Expr {
+    BoolLit(bool),
     IntLit(i64),
     Ident(Ident),
     BinOp(BinOp, Box<Expr>, Box<Expr>),
@@ -52,10 +54,17 @@ enum TokenKind {
     Period,
     Semicolon,
     Colon,
+    KwBoolean,
     KwInteger,
     KwString,
     KwBegin,
     KwEnd,
+    KwTrue,
+    KwIf,
+    KwThen,
+    KwElse,
+    KwFi,
+    KwFalse,
     Unknown,
     Eof,
 }
@@ -178,10 +187,17 @@ impl<'a> Scanner<'a> {
 
     fn scan(&'a mut self) -> Tokens<'a> {
         let mut keywords = HashMap::new();
+        keywords.insert("boolean", TokenKind::KwBoolean);
         keywords.insert("integer", TokenKind::KwInteger);
         keywords.insert("string", TokenKind::KwString);
         keywords.insert("begin", TokenKind::KwBegin);
         keywords.insert("end", TokenKind::KwEnd);
+        keywords.insert("if", TokenKind::KwIf);
+        keywords.insert("then", TokenKind::KwThen);
+        keywords.insert("else", TokenKind::KwElse);
+        keywords.insert("fi", TokenKind::KwFi);
+        keywords.insert("true", TokenKind::KwTrue);
+        keywords.insert("false", TokenKind::KwFalse);
         Tokens::new(&mut self.reader, keywords)
     }
 }
@@ -199,6 +215,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn is_builtin_type_name(tok: &Token) -> bool {
+        tok.kind == TokenKind::KwBoolean
+            || tok.kind == TokenKind::KwInteger
+            || tok.kind == TokenKind::KwString
+    }
+
     fn expect(&mut self, expected: TokenKind) -> String {
         match self.tokens.next() {
             Some(tok) if tok.kind == expected => tok.text,
@@ -214,6 +236,7 @@ impl<'a> Parser<'a> {
         Ident(self.expect(TokenKind::Ident))
     }
 
+    // ident_list ::= Ident {',' Ident}
     fn ident_list(&mut self) -> Vec<Ident> {
         let mut idents = vec![self.ident()];
         while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Comma) {
@@ -238,29 +261,57 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::KwBegin);
         while matches!(
             self.tokens.peek(),
-            Some(tok) if tok.kind == TokenKind::KwInteger || tok.kind == TokenKind::KwString
+            Some(tok) if Self::is_builtin_type_name(tok)
         ) {
             let ty_name = TypeName(self.tokens.next().unwrap().text);
             declarations.push((ty_name, self.ident_list()));
             self.expect(TokenKind::Semicolon);
         }
+        let body = self.statement_list();
+        self.expect(TokenKind::KwEnd);
+        Block { declarations, body }
+    }
+
+    fn statement_list(&mut self) -> Vec<Stmt> {
         let mut body = vec![self.statement()];
         while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Semicolon) {
             self.tokens.next();
             body.push(self.statement());
         }
-        self.expect(TokenKind::KwEnd);
-        Block { declarations, body }
+        body
     }
 
     fn statement(&mut self) -> Stmt {
-        let lhs = self.simple_expr();
-        if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
-            self.tokens.next();
-            let rhs = self.simple_expr();
-            return Stmt::Assign(Box::new(lhs), Box::new(rhs));
+        match self.tokens.peek() {
+            Some(tok) if tok.kind == TokenKind::KwIf => self.if_(),
+            _ => {
+                let lhs = self.simple_expr();
+                if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
+                    return self.assignment(lhs);
+                }
+                Stmt::Expr(Box::new(lhs))
+            }
         }
-        Stmt::Expr(Box::new(lhs))
+    }
+
+    fn if_(&mut self) -> Stmt {
+        self.expect(TokenKind::KwIf);
+        let test = self.simple_expr();
+        self.expect(TokenKind::KwThen);
+        let cons = self.statement_list();
+        let mut alt = Vec::new();
+        if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwElse) {
+            self.tokens.next();
+            alt = self.statement_list();
+        }
+        self.expect(TokenKind::KwFi);
+        Stmt::If(Box::new(test), cons, alt)
+    }
+
+    fn assignment(&mut self, lhs: Expr) -> Stmt {
+        self.expect(TokenKind::Becomes);
+        let rhs = self.simple_expr();
+        return Stmt::Assign(Box::new(lhs), Box::new(rhs));
     }
 
     fn simple_expr(&mut self) -> Expr {
@@ -286,6 +337,8 @@ impl<'a> Parser<'a> {
     fn factor(&mut self) -> Expr {
         let tok = self.tokens.next().expect("expecting factor");
         match tok.kind {
+            TokenKind::KwTrue => Expr::BoolLit(true),
+            TokenKind::KwFalse => Expr::BoolLit(false),
             TokenKind::IntLit => Expr::IntLit(tok.text.parse().expect("malformed integer literal")),
             TokenKind::Ident => Expr::Ident(Ident(tok.text)),
             _ => panic!("sytactic error: expecting factor"),
@@ -297,12 +350,14 @@ impl<'a> Parser<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Type {
+    Boolean,
     Integer,
     String,
 }
 
 fn resolve_type(name: &str) -> Type {
     match name {
+        "boolean" => Type::Boolean,
         "integer" => Type::Integer,
         "string" => Type::String,
         _ => panic!("type error: unknown type {}", name),
@@ -333,11 +388,24 @@ fn type_check_stmt(ty_env: &HashMap<Ident, Type>, stmt: &Stmt) {
                 panic!("type error: trying to assign {:?} to {:?}", rty, lty);
             }
         }
+        Stmt::If(test, cons, alt) => {
+            let cty = type_of_expr(ty_env, test);
+            if cty != Type::Boolean {
+                panic!("type error: if condition must be a boolean value");
+            }
+            for stmt in cons {
+                type_check_stmt(ty_env, stmt);
+            }
+            for stmt in alt {
+                type_check_stmt(ty_env, stmt);
+            }
+        }
     };
 }
 
 fn type_of_expr(ty_env: &HashMap<Ident, Type>, expr: &Expr) -> Type {
     match expr {
+        &Expr::BoolLit(_) => Type::Boolean,
         Expr::IntLit(_) => Type::Integer,
         Expr::Ident(id) => ty_env
             .get(id)
@@ -356,9 +424,13 @@ fn type_of_expr(ty_env: &HashMap<Ident, Type>, expr: &Expr) -> Type {
 
 // Compiler + VM
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct LocalIdx(usize);
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LabelIdx(usize);
+
+#[derive(Clone, Copy)]
 enum OpCode {
     LdcI8(i64),
     LdLoc(LocalIdx),
@@ -366,6 +438,9 @@ enum OpCode {
     Add,
     Sub,
     Ret,
+    Br(LabelIdx),
+    BrFalse(LabelIdx),
+    Nop,
 }
 
 impl Display for OpCode {
@@ -376,21 +451,28 @@ impl Display for OpCode {
             OpCode::StLoc(idx) => f.write_fmt(format_args!("stloc {}", idx.0)),
             OpCode::Add => f.write_str("add"),
             OpCode::Sub => f.write_str("sub"),
+            OpCode::Br(lab) => f.write_fmt(format_args!("br {}", lab.0)),
+            OpCode::BrFalse(lab) => f.write_fmt(format_args!("br.false {}", lab.0)),
             OpCode::Ret => f.write_str("ret"),
+            OpCode::Nop => f.write_str("nop"),
         }
     }
 }
 
 struct CodeBlock {
     code: Vec<OpCode>,
+    labels: HashMap<LabelIdx, usize>,
     next_local_idx: usize,
+    next_label_idx: usize,
 }
 
 impl CodeBlock {
     fn new() -> Self {
         Self {
             code: Vec::new(),
+            labels: HashMap::new(),
             next_local_idx: 0,
+            next_label_idx: 0,
         }
     }
 
@@ -400,8 +482,34 @@ impl CodeBlock {
         idx
     }
 
+    fn new_label(&mut self) -> LabelIdx {
+        let idx = LabelIdx(self.next_label_idx);
+        self.next_label_idx += 1;
+        idx
+    }
+
+    fn mark_label(&mut self, label: LabelIdx) {
+        self.labels.insert(label, self.code.len());
+    }
+
     fn emit(&mut self, op: OpCode) {
         self.code.push(op);
+    }
+
+    fn backpatch(&mut self) {
+        self.code = self
+            .code
+            .iter()
+            .map(|op| match op {
+                OpCode::BrFalse(lab) => {
+                    OpCode::BrFalse(LabelIdx(*self.labels.get(lab).expect("unknown label")))
+                }
+                OpCode::Br(lab) => {
+                    OpCode::Br(LabelIdx(*self.labels.get(lab).expect("unknown label")))
+                }
+                op => op.clone(),
+            })
+            .collect();
     }
 }
 
@@ -433,26 +541,45 @@ impl Vm {
     fn run(&mut self, gen: &CodeBlock) -> i64 {
         self.call_stack
             .push(ActivationRecord::new(gen.next_local_idx));
-        for op in &gen.code {
-            match op {
-                OpCode::LdcI8(n) => self.stack.push(*n),
-                OpCode::LdLoc(idx) => self
-                    .stack
-                    .push(self.call_stack.last().unwrap().locals[idx.0]),
+        let mut ip = 0;
+        while ip < gen.code.len() {
+            match gen.code[ip] {
+                OpCode::LdcI8(n) => {
+                    self.stack.push(n);
+                    ip += 1;
+                }
+                OpCode::LdLoc(idx) => {
+                    self.stack
+                        .push(self.call_stack.last().unwrap().locals[idx.0]);
+                    ip += 1;
+                }
                 OpCode::StLoc(idx) => {
                     let arec = self.call_stack.last_mut().unwrap();
                     arec.locals[idx.0] = self.stack.pop().expect("stack underflow");
+                    ip += 1;
                 }
                 OpCode::Add => {
                     let n = self.stack.pop().expect("stack underflow");
                     let m = self.stack.pop().expect("stack underflow");
                     self.stack.push(m + n);
+                    ip += 1;
                 }
                 OpCode::Sub => {
                     let n = self.stack.pop().expect("stack underflow");
                     let m = self.stack.pop().expect("stack underflow");
                     self.stack.push(m - n);
+                    ip += 1;
                 }
+                OpCode::Br(loc) => ip = loc.0,
+                OpCode::BrFalse(loc) => {
+                    let x = self.stack.pop().expect("stack underflow");
+                    if x == 0 {
+                        ip = loc.0;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                OpCode::Nop => ip += 1,
                 OpCode::Ret => break,
             }
         }
@@ -461,7 +588,7 @@ impl Vm {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum Item {
     Imm(i64),
     Stack,
@@ -474,8 +601,6 @@ fn compile_block(block: &Block, gen: &mut CodeBlock) {
         for id in ids {
             let idx = gen.add_local();
             names.insert(id.clone(), idx);
-            // gen.emit(OpCode::LdcI8(0));
-            // gen.emit(OpCode::StLoc(idx));
         }
     }
     for s in &block.body {
@@ -497,20 +622,33 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Loc
                 gen.emit(OpCode::StLoc(idx));
             }
         },
+        Stmt::If(test, cons, alt) => {
+            let else_lab = gen.new_label();
+            let end_lab = gen.new_label();
+            let titem = compile_expr(test, gen, names);
+            load(gen, titem);
+            gen.emit(OpCode::BrFalse(else_lab));
+            for stmt in cons {
+                compile_stmt(stmt, gen, names);
+            }
+            gen.emit(OpCode::Br(end_lab));
+            gen.mark_label(else_lab);
+            for stmt in alt {
+                compile_stmt(stmt, gen, names);
+            }
+            gen.mark_label(end_lab);
+        }
     }
 }
 
 fn compile_expr(expr: &Expr, gen: &mut CodeBlock, names: &HashMap<Ident, LocalIdx>) -> Item {
     match expr {
-        Expr::IntLit(n) => {
-            // gen.emit(OpCode::LdcI8(*n));
-            Item::Imm(*n)
-        }
+        Expr::BoolLit(b) => Item::Imm(if *b { 1 } else { 0 }),
+        Expr::IntLit(n) => Item::Imm(*n),
         Expr::Ident(id) => {
             let idx = names
                 .get(id)
                 .unwrap_or_else(|| panic!("unbound identifier: {}", id.0));
-            // gen.emit(OpCode::LdLoc(*idx));
             Item::Local(*idx)
         }
         Expr::BinOp(op, lhs, rhs) => {
@@ -562,6 +700,8 @@ fn main() {
 
         let mut gen = CodeBlock::new();
         compile_block(&node, &mut gen);
+        gen.backpatch();
+
         println!("; code:");
         for op in &gen.code {
             println!(";   {}", op);
