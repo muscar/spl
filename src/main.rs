@@ -17,16 +17,22 @@ struct Ident(String);
 struct TypeName(String);
 
 #[derive(Debug)]
-struct Block {
-    declarations: Vec<(TypeName, Vec<Ident>)>,
-    body: Vec<Stmt>,
+struct Program {
+    body: Stmt,
 }
 
 #[derive(Debug)]
 enum Stmt {
     Expr(Box<Expr>),
+    Block(Vec<(TypeName, Vec<Ident>)>, Vec<Stmt>),
     Assign(Box<Expr>, Box<Expr>),
     IfThenElse(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
+    BeginUntil(
+        Vec<(TypeName, Vec<Ident>)>,
+        Vec<Ident>,
+        Vec<Stmt>,
+        Vec<(Ident, Vec<Stmt>)>,
+    ),
     LoopWhile(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
     LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Vec<Stmt>)>),
 }
@@ -355,30 +361,14 @@ impl<'a> Parser<'a> {
         idents
     }
 
-    fn parse(&mut self) -> Block {
+    fn parse(&mut self) -> Program {
         self.program()
     }
 
-    fn program(&mut self) -> Block {
-        let expr = self.block();
+    fn program(&mut self) -> Program {
+        let body = self.statement();
         self.expect(TokenKind::Period);
-        expr
-    }
-
-    fn block(&mut self) -> Block {
-        let mut declarations = vec![];
-        self.expect(TokenKind::KwBegin);
-        while matches!(
-            self.tokens.peek(),
-            Some(tok) if Self::is_builtin_type_name(tok)
-        ) {
-            let ty_name = TypeName(self.tokens.next().unwrap().text);
-            declarations.push((ty_name, self.ident_list(TokenKind::Comma)));
-            self.expect(TokenKind::Semicolon);
-        }
-        let body = self.statement_list();
-        self.expect(TokenKind::KwEnd);
-        Block { declarations, body }
+        Program { body }
     }
 
     fn statement_list(&mut self) -> Vec<Stmt> {
@@ -392,6 +382,7 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self) -> Stmt {
         match self.tokens.peek() {
+            Some(tok) if tok.kind == TokenKind::KwBegin => self.block_dispatch(),
             Some(tok) if tok.kind == TokenKind::KwIf => self.if_then_else(),
             Some(tok) if tok.kind == TokenKind::KwLoop => self.loop_dispatch(),
             _ => {
@@ -402,6 +393,52 @@ impl<'a> Parser<'a> {
                 Stmt::Expr(Box::new(lhs))
             }
         }
+    }
+
+    fn block_dispatch(&mut self) -> Stmt {
+        self.expect(TokenKind::KwBegin);
+        if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwUntil) {
+            return self.begin_until();
+        }
+        self.begin()
+    }
+
+    fn begin(&mut self) -> Stmt {
+        let mut declarations = vec![];
+        while matches!(
+            self.tokens.peek(),
+            Some(tok) if Self::is_builtin_type_name(tok)
+        ) {
+            let ty_name = TypeName(self.tokens.next().unwrap().text);
+            declarations.push((ty_name, self.ident_list(TokenKind::Comma)));
+            self.expect(TokenKind::Semicolon);
+        }
+        let body = self.statement_list();
+        self.expect(TokenKind::KwEnd);
+        Stmt::Block(declarations, body)
+    }
+
+    fn begin_until(&mut self) -> Stmt {
+        self.expect(TokenKind::KwUntil);
+        let mut declarations = vec![];
+        while matches!(
+            self.tokens.peek(),
+            Some(tok) if Self::is_builtin_type_name(tok)
+        ) {
+            let ty_name = TypeName(self.tokens.next().unwrap().text);
+            declarations.push((ty_name, self.ident_list(TokenKind::Comma)));
+            self.expect(TokenKind::Semicolon);
+        }
+        let situations = self.ident_list(TokenKind::KwOr);
+        let s = self.statement_list();
+        self.expect(TokenKind::KwEnd);
+        self.expect(TokenKind::KwThen);
+        let mut handlers = vec![self.situation_handler()];
+        while !matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwFi) {
+            handlers.push(self.situation_handler());
+        }
+        self.expect(TokenKind::KwFi);
+        Stmt::BeginUntil(declarations, situations, s, handlers)
     }
 
     fn loop_dispatch(&mut self) -> Stmt {
@@ -568,22 +605,48 @@ fn resolve_type(name: &str) -> Type {
     }
 }
 
-fn type_check_block(ty_env: &mut HashMap<Ident, Type>, block: &Block) {
-    for (ty_name, ids) in &block.declarations {
-        let ty = resolve_type(&ty_name.0);
-        for id in ids {
-            ty_env.insert(id.clone(), ty);
-        }
-    }
-    for stmt in &block.body {
-        type_check_stmt(ty_env, stmt);
-    }
+fn type_check(ty_env: &mut HashMap<Ident, Type>, prog: &Program) {
+    type_check_stmt(ty_env, &prog.body);
 }
 
 fn type_check_stmt(ty_env: &mut HashMap<Ident, Type>, stmt: &Stmt) {
     match stmt {
         Stmt::Expr(e) => {
             type_of_expr(ty_env, e);
+        }
+        Stmt::Block(declarations, body) => {
+            for (ty_name, ids) in declarations {
+                let ty = resolve_type(&ty_name.0);
+                for id in ids {
+                    ty_env.insert(id.clone(), ty);
+                }
+            }
+            for stmt in body {
+                type_check_stmt(ty_env, stmt);
+            }
+        }
+        Stmt::BeginUntil(declarations, situations, s, handlers) => {
+            for (ty_name, ids) in declarations {
+                let ty = resolve_type(&ty_name.0);
+                for id in ids {
+                    ty_env.insert(id.clone(), ty);
+                }
+            }
+            for id in situations {
+                ty_env.insert(id.clone(), Type::Integer);
+            }
+            for stmt in s {
+                type_check_stmt(ty_env, stmt);
+            }
+            for (id, s) in handlers {
+                // TODO: this is inefficient
+                if !situations.contains(id) {
+                    panic!("type error: situation in handler is not present in loop until declaration: {}", id.0)
+                }
+                for stmt in s {
+                    type_check_stmt(ty_env, stmt);
+                }
+            }
         }
         Stmt::Assign(lhs, rhs) => {
             let lty = type_of_expr(ty_env, lhs);
@@ -880,17 +943,9 @@ enum Item {
     Local(LocalIdx),
 }
 
-fn compile_block(block: &Block, gen: &mut CodeBlock) {
+fn compile(prog: &Program, gen: &mut CodeBlock) {
     let mut names = HashMap::new();
-    for (_, ids) in &block.declarations {
-        for id in ids {
-            let idx = gen.add_local();
-            names.insert(id.clone(), Symbol::Local(idx));
-        }
-    }
-    for s in &block.body {
-        compile_stmt(s, gen, &mut names);
-    }
+    compile_stmt(&prog.body, gen, &mut names);
 }
 
 fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Symbol>) {
@@ -898,6 +953,47 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Sym
         Stmt::Expr(e) => {
             let item = compile_expr(e, gen, names);
             load(gen, item);
+        }
+        Stmt::Block(declarations, body) => {
+            for (_, ids) in declarations {
+                for id in ids {
+                    let idx = gen.add_local();
+                    names.insert(id.clone(), Symbol::Local(idx));
+                }
+            }
+            for s in body {
+                compile_stmt(s, gen, names);
+            }
+        }
+        Stmt::BeginUntil(declarations, situations, s, handlers) => {
+            for (_, ids) in declarations {
+                for id in ids {
+                    let idx = gen.add_local();
+                    names.insert(id.clone(), Symbol::Local(idx));
+                }
+            }
+            let end_lab = gen.new_label();
+            let mut situation_labs = HashMap::new();
+            for id in situations {
+                let lab = gen.new_label();
+                names.insert(id.clone(), Symbol::Situation(lab));
+                situation_labs.insert(id.clone(), lab);
+            }
+            for stmt in s {
+                compile_stmt(stmt, gen, names);
+            }
+            for (id, s) in handlers {
+                gen.mark_label(
+                    *situation_labs
+                        .get(id)
+                        .expect("unknown situation label. bug?"),
+                );
+                for stmt in s {
+                    compile_stmt(stmt, gen, names);
+                }
+                gen.emit(OpCode::Br(end_lab));
+            }
+            gen.mark_label(end_lab);
         }
         Stmt::Assign(lhs, rhs) => match compile_expr(lhs, gen, names) {
             Item::Imm(_) | Item::Stack => panic!("trying to assign to value on stack! bug?"),
@@ -1060,10 +1156,10 @@ fn compile_and_run(s: &str) {
     println!("; {:?}", node);
 
     let mut ty_env = HashMap::new();
-    type_check_block(&mut ty_env, &node);
+    type_check(&mut ty_env, &node);
 
     let mut gen = CodeBlock::new();
-    compile_block(&node, &mut gen);
+    compile(&node, &mut gen);
     gen.backpatch();
 
     println!("; code:");
