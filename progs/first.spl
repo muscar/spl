@@ -1,0 +1,18 @@
+begin
+  integer x;
+  boolean success;
+  x := 4;
+  loop until found or error
+    if x > 5 then
+      x := x - 1
+    else
+      if x = 5 then found else error fi
+    fi;
+    x := x - 1
+  repeat
+  then
+    found => success := true
+    error => success := false
+  fi;
+  success
+end.

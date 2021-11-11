@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    env,
     fmt::Display,
+    fs,
     io::{self, Write},
     iter::Peekable,
     str::Chars,
@@ -25,7 +27,8 @@ enum Stmt {
     Expr(Box<Expr>),
     Assign(Box<Expr>, Box<Expr>),
     IfThenElse(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
-    LoopWhileRepeat(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
+    LoopWhile(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
+    LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Vec<Stmt>)>),
 }
 
 #[derive(Debug)]
@@ -70,6 +73,7 @@ enum TokenKind {
     Gte,
     Tilde,
     Becomes,
+    FatArrow,
     Comma,
     Period,
     Semicolon,
@@ -89,6 +93,8 @@ enum TokenKind {
     KwLoop,
     KwWhile,
     KwRepeat,
+    KwUntil,
+    KwOr,
     KwFalse,
     Unknown,
     Eof,
@@ -153,7 +159,12 @@ impl<'a> Iterator for Tokens<'a> {
             }
             Some('=') => {
                 token.text.push(self.reader.read().unwrap());
-                TokenKind::Eq
+                if self.reader.peek() == Some('>') {
+                    token.text.push(self.reader.read().unwrap());
+                    TokenKind::FatArrow
+                } else {
+                    TokenKind::Eq
+                }
             }
             Some('≠') => {
                 token.text.push(self.reader.read().unwrap());
@@ -276,6 +287,8 @@ impl<'a> Scanner<'a> {
         keywords.insert("loop", TokenKind::KwLoop);
         keywords.insert("while", TokenKind::KwWhile);
         keywords.insert("repeat", TokenKind::KwRepeat);
+        keywords.insert("until", TokenKind::KwUntil);
+        keywords.insert("or", TokenKind::KwOr);
         keywords.insert("true", TokenKind::KwTrue);
         keywords.insert("false", TokenKind::KwFalse);
         Tokens::new(&mut self.reader, keywords)
@@ -333,9 +346,9 @@ impl<'a> Parser<'a> {
     }
 
     // ident_list ::= Ident {',' Ident}
-    fn ident_list(&mut self) -> Vec<Ident> {
+    fn ident_list(&mut self, sep: TokenKind) -> Vec<Ident> {
         let mut idents = vec![self.ident()];
-        while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Comma) {
+        while matches!(self.tokens.peek(), Some(tok) if tok.kind == sep) {
             self.tokens.next();
             idents.push(self.ident());
         }
@@ -360,7 +373,7 @@ impl<'a> Parser<'a> {
             Some(tok) if Self::is_builtin_type_name(tok)
         ) {
             let ty_name = TypeName(self.tokens.next().unwrap().text);
-            declarations.push((ty_name, self.ident_list()));
+            declarations.push((ty_name, self.ident_list(TokenKind::Comma)));
             self.expect(TokenKind::Semicolon);
         }
         let body = self.statement_list();
@@ -380,7 +393,7 @@ impl<'a> Parser<'a> {
     fn statement(&mut self) -> Stmt {
         match self.tokens.peek() {
             Some(tok) if tok.kind == TokenKind::KwIf => self.if_then_else(),
-            Some(tok) if tok.kind == TokenKind::KwLoop => self.loop_while_repeat(),
+            Some(tok) if tok.kind == TokenKind::KwLoop => self.loop_dispatch(),
             _ => {
                 let lhs = self.expr();
                 if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
@@ -391,8 +404,36 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn loop_while_repeat(&mut self) -> Stmt {
+    fn loop_dispatch(&mut self) -> Stmt {
         self.expect(TokenKind::KwLoop);
+        if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwUntil) {
+            return self.loop_until_repeat();
+        }
+        self.loop_while_repeat()
+    }
+
+    fn loop_until_repeat(&mut self) -> Stmt {
+        self.expect(TokenKind::KwUntil);
+        let situations = self.ident_list(TokenKind::KwOr);
+        let s = self.statement_list();
+        self.expect(TokenKind::KwRepeat);
+        self.expect(TokenKind::KwThen);
+        let mut handlers = vec![self.situation_handler()];
+        while !matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwFi) {
+            handlers.push(self.situation_handler());
+        }
+        self.expect(TokenKind::KwFi);
+        Stmt::LoopUntil(situations, s, handlers)
+    }
+
+    fn situation_handler(&mut self) -> (Ident, Vec<Stmt>) {
+        let situation = self.ident();
+        self.expect(TokenKind::FatArrow);
+        let s = self.statement_list();
+        (situation, s)
+    }
+
+    fn loop_while_repeat(&mut self) -> Stmt {
         let mut s = Vec::new();
         if !matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwWhile) {
             s = self.statement_list();
@@ -404,7 +445,7 @@ impl<'a> Parser<'a> {
             t = self.statement_list();
         }
         self.expect(TokenKind::KwRepeat);
-        Stmt::LoopWhileRepeat(s, Box::new(test), t)
+        Stmt::LoopWhile(s, Box::new(test), t)
     }
 
     fn if_then_else(&mut self) -> Stmt {
@@ -539,7 +580,7 @@ fn type_check_block(ty_env: &mut HashMap<Ident, Type>, block: &Block) {
     }
 }
 
-fn type_check_stmt(ty_env: &HashMap<Ident, Type>, stmt: &Stmt) {
+fn type_check_stmt(ty_env: &mut HashMap<Ident, Type>, stmt: &Stmt) {
     match stmt {
         Stmt::Expr(e) => {
             type_of_expr(ty_env, e);
@@ -551,7 +592,7 @@ fn type_check_stmt(ty_env: &HashMap<Ident, Type>, stmt: &Stmt) {
                 panic!("type error: trying to assign {:?} to {:?}", rty, lty);
             }
         }
-        Stmt::IfThenElse(test, s, t) | Stmt::LoopWhileRepeat(s, test, t) => {
+        Stmt::IfThenElse(test, s, t) | Stmt::LoopWhile(s, test, t) => {
             let tty = type_of_expr(ty_env, test);
             if tty != Type::Boolean {
                 panic!("type error: condition must be a boolean value");
@@ -561,6 +602,23 @@ fn type_check_stmt(ty_env: &HashMap<Ident, Type>, stmt: &Stmt) {
             }
             for stmt in t {
                 type_check_stmt(ty_env, stmt);
+            }
+        }
+        Stmt::LoopUntil(situations, s, handlers) => {
+            for id in situations {
+                ty_env.insert(id.clone(), Type::Integer);
+            }
+            for stmt in s {
+                type_check_stmt(ty_env, stmt);
+            }
+            for (id, s) in handlers {
+                // TODO: this is inefficient
+                if !situations.contains(id) {
+                    panic!("type error: situation in handler is not present in loop until declaration: {}", id.0)
+                }
+                for stmt in s {
+                    type_check_stmt(ty_env, stmt);
+                }
             }
         }
     };
@@ -614,7 +672,7 @@ fn type_of_expr(ty_env: &HashMap<Ident, Type>, expr: &Expr) -> Type {
 
 // Compiler + VM
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct LocalIdx(usize);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -809,6 +867,12 @@ impl Vm {
     }
 }
 
+#[derive(PartialEq, Eq, Hash)]
+enum Symbol {
+    Local(LocalIdx),
+    Situation(LabelIdx),
+}
+
 #[derive(Clone, Copy)]
 enum Item {
     Imm(i64),
@@ -821,7 +885,7 @@ fn compile_block(block: &Block, gen: &mut CodeBlock) {
     for (_, ids) in &block.declarations {
         for id in ids {
             let idx = gen.add_local();
-            names.insert(id.clone(), idx);
+            names.insert(id.clone(), Symbol::Local(idx));
         }
     }
     for s in &block.body {
@@ -829,7 +893,7 @@ fn compile_block(block: &Block, gen: &mut CodeBlock) {
     }
 }
 
-fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, LocalIdx>) {
+fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Symbol>) {
     match stmt {
         Stmt::Expr(e) => {
             let item = compile_expr(e, gen, names);
@@ -859,7 +923,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Loc
             }
             gen.mark_label(end_lab);
         }
-        Stmt::LoopWhileRepeat(s, test, t) => {
+        Stmt::LoopWhile(s, test, t) => {
             let loop_lab = gen.new_label();
             let end_lab = gen.new_label();
             gen.mark_label(loop_lab);
@@ -875,18 +939,52 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Loc
             gen.emit(OpCode::Br(loop_lab));
             gen.mark_label(end_lab);
         }
+        Stmt::LoopUntil(situations, s, handlers) => {
+            let loop_lab = gen.new_label();
+            let end_lab = gen.new_label();
+            let mut situation_labs = HashMap::new();
+            for id in situations {
+                let lab = gen.new_label();
+                names.insert(id.clone(), Symbol::Situation(lab));
+                situation_labs.insert(id.clone(), lab);
+            }
+            gen.mark_label(loop_lab);
+            for stmt in s {
+                compile_stmt(stmt, gen, names);
+            }
+            gen.emit(OpCode::Br(loop_lab));
+            for (id, s) in handlers {
+                gen.mark_label(
+                    *situation_labs
+                        .get(id)
+                        .expect("unknown situation label. bug?"),
+                );
+                for stmt in s {
+                    compile_stmt(stmt, gen, names);
+                }
+                gen.emit(OpCode::Br(end_lab));
+            }
+            gen.mark_label(end_lab);
+        }
     }
 }
 
-fn compile_expr(expr: &Expr, gen: &mut CodeBlock, names: &HashMap<Ident, LocalIdx>) -> Item {
+fn compile_expr(expr: &Expr, gen: &mut CodeBlock, names: &HashMap<Ident, Symbol>) -> Item {
     match expr {
         Expr::BoolLit(b) => Item::Imm(if *b { 1 } else { 0 }),
         Expr::IntLit(n) => Item::Imm(*n),
         Expr::Ident(id) => {
-            let idx = names
+            let sym = names
                 .get(id)
                 .unwrap_or_else(|| panic!("unbound identifier: {}", id.0));
-            Item::Local(*idx)
+            match sym {
+                Symbol::Local(idx) => Item::Local(*idx),
+                Symbol::Situation(lab) => {
+                    gen.emit(OpCode::Br(*lab));
+                    // TODO: Is this right?
+                    Item::Stack
+                }
+            }
         }
         Expr::UnOp(op, arg) => {
             let aitem = compile_expr(arg, gen, names);
@@ -954,7 +1052,30 @@ fn load(gen: &mut CodeBlock, item: Item) {
     }
 }
 
-fn main() {
+fn compile_and_run(s: &str) {
+    let sr = SourceReader::new(s);
+    let mut s = Scanner::new(sr);
+    let mut p = Parser::new(s.scan());
+    let node = p.parse();
+    println!("; {:?}", node);
+
+    let mut ty_env = HashMap::new();
+    type_check_block(&mut ty_env, &node);
+
+    let mut gen = CodeBlock::new();
+    compile_block(&node, &mut gen);
+    gen.backpatch();
+
+    println!("; code:");
+    for (off, op) in gen.code.iter().enumerate() {
+        println!(";   {:02}: {}", off, op);
+    }
+
+    let mut vm = Vm::new();
+    println!("; {:?}", vm.run(&gen));
+}
+
+fn repl() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut buf = String::new();
@@ -962,27 +1083,17 @@ fn main() {
         stdout.write_all(b"> ").unwrap();
         stdout.flush().unwrap();
         stdin.read_line(&mut buf).unwrap();
-        let sr = SourceReader::new(&buf);
-        let mut s = Scanner::new(sr);
-        let mut p = Parser::new(s.scan());
-        let node = p.parse();
-        println!("; {:?}", node);
-
-        let mut ty_env = HashMap::new();
-        type_check_block(&mut ty_env, &node);
-
-        let mut gen = CodeBlock::new();
-        compile_block(&node, &mut gen);
-        gen.backpatch();
-
-        println!("; code:");
-        for (off, op) in gen.code.iter().enumerate() {
-            println!(";   {:02}: {}", off, op);
-        }
-
-        let mut vm = Vm::new();
-        println!("; {:?}", vm.run(&gen));
-
+        compile_and_run(&buf);
         buf.clear();
+    }
+}
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<String>>();
+    if args.is_empty() {
+        repl();
+    } else {
+        let s = fs::read_to_string(&args[0]).expect("could not read source file");
+        compile_and_run(&s);
     }
 }
