@@ -13,7 +13,7 @@ use std::{
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 struct Ident(String);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TypeName(String);
 
 #[derive(Debug)]
@@ -24,17 +24,19 @@ struct Program {
 #[derive(Debug)]
 enum Stmt {
     Expr(Box<Expr>),
-    Block(Vec<(TypeName, Vec<Ident>)>, Vec<Stmt>),
+    Block(Vec<VarDecl>, Vec<Stmt>),
     Assign(Box<Expr>, Box<Expr>),
     IfThenElse(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
-    BeginUntil(
-        Vec<(TypeName, Vec<Ident>)>,
-        Vec<Ident>,
-        Vec<Stmt>,
-        Vec<(Ident, Vec<Stmt>)>,
-    ),
+    BeginUntil(Vec<VarDecl>, Vec<Ident>, Vec<Stmt>, Vec<(Ident, Vec<Stmt>)>),
     LoopWhile(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
     LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Vec<Stmt>)>),
+}
+
+#[derive(Debug)]
+struct VarDecl {
+    name: Ident,
+    ty_annot: Option<TypeName>,
+    init_expr: Option<Expr>,
 }
 
 #[derive(Debug)]
@@ -89,9 +91,9 @@ enum TokenKind {
     KwBoolean,
     KwInteger,
     KwString,
+    KwLet,
     KwBegin,
     KwEnd,
-    KwTrue,
     KwIf,
     KwThen,
     KwElse,
@@ -101,6 +103,7 @@ enum TokenKind {
     KwRepeat,
     KwUntil,
     KwOr,
+    KwTrue,
     KwFalse,
     Unknown,
     Eof,
@@ -215,6 +218,10 @@ impl<'a> Iterator for Tokens<'a> {
                 token.text.push(self.reader.read().unwrap());
                 TokenKind::Tilde
             }
+            Some(',') => {
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Comma
+            }
             Some('.') => {
                 token.text.push(self.reader.read().unwrap());
                 TokenKind::Period
@@ -284,6 +291,7 @@ impl<'a> Scanner<'a> {
         keywords.insert("boolean", TokenKind::KwBoolean);
         keywords.insert("integer", TokenKind::KwInteger);
         keywords.insert("string", TokenKind::KwString);
+        keywords.insert("let", TokenKind::KwLet);
         keywords.insert("begin", TokenKind::KwBegin);
         keywords.insert("end", TokenKind::KwEnd);
         keywords.insert("if", TokenKind::KwIf);
@@ -404,15 +412,7 @@ impl<'a> Parser<'a> {
     }
 
     fn begin(&mut self) -> Stmt {
-        let mut declarations = vec![];
-        while matches!(
-            self.tokens.peek(),
-            Some(tok) if Self::is_builtin_type_name(tok)
-        ) {
-            let ty_name = TypeName(self.tokens.next().unwrap().text);
-            declarations.push((ty_name, self.ident_list(TokenKind::Comma)));
-            self.expect(TokenKind::Semicolon);
-        }
+        let declarations = self.var_decls();
         let body = self.statement_list();
         self.expect(TokenKind::KwEnd);
         Stmt::Block(declarations, body)
@@ -420,15 +420,7 @@ impl<'a> Parser<'a> {
 
     fn begin_until(&mut self) -> Stmt {
         self.expect(TokenKind::KwUntil);
-        let mut declarations = vec![];
-        while matches!(
-            self.tokens.peek(),
-            Some(tok) if Self::is_builtin_type_name(tok)
-        ) {
-            let ty_name = TypeName(self.tokens.next().unwrap().text);
-            declarations.push((ty_name, self.ident_list(TokenKind::Comma)));
-            self.expect(TokenKind::Semicolon);
-        }
+        let declarations = self.var_decls();
         let situations = self.ident_list(TokenKind::KwOr);
         let s = self.statement_list();
         self.expect(TokenKind::KwEnd);
@@ -439,6 +431,54 @@ impl<'a> Parser<'a> {
         }
         self.expect(TokenKind::KwFi);
         Stmt::BeginUntil(declarations, situations, s, handlers)
+    }
+
+    fn var_decls(&mut self) -> Vec<VarDecl> {
+        let mut decls = Vec::new();
+        while matches!(
+            self.tokens.peek(),
+            Some(tok) if Self::is_builtin_type_name(tok) || tok.kind == TokenKind::KwLet
+        ) {
+            let ty_annot = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwLet)
+            {
+                self.tokens.next();
+                None
+            } else {
+                Some(TypeName(self.tokens.next().unwrap().text))
+            };
+            let name = self.ident();
+            let init_expr = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes)
+            {
+                self.tokens.next();
+                Some(self.expr())
+            } else {
+                None
+            };
+            decls.push(VarDecl {
+                name,
+                ty_annot: ty_annot.clone(),
+                init_expr,
+            });
+            while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Comma) {
+                self.tokens.next();
+                let name = self.ident();
+                let init_expr = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes)
+                {
+                    self.tokens.next();
+                    Some(self.expr())
+                } else {
+                    None
+                };
+                decls.push(VarDecl {
+                    name,
+                    ty_annot: ty_annot.clone(),
+                    init_expr,
+                });
+            }
+
+            self.expect(TokenKind::Semicolon);
+        }
+        decls
     }
 
     fn loop_dispatch(&mut self) -> Stmt {
@@ -596,12 +636,12 @@ enum Type {
     String,
 }
 
-fn resolve_type(name: &str) -> Type {
-    match name {
+fn resolve_type(name: &TypeName) -> Type {
+    match &name.0[..] {
         "boolean" => Type::Boolean,
         "integer" => Type::Integer,
         "string" => Type::String,
-        _ => panic!("type error: unknown type {}", name),
+        _ => panic!("type error: unknown type {}", name.0),
     }
 }
 
@@ -615,22 +655,36 @@ fn type_check_stmt(ty_env: &mut HashMap<Ident, Type>, stmt: &Stmt) {
             type_of_expr(ty_env, e);
         }
         Stmt::Block(declarations, body) => {
-            for (ty_name, ids) in declarations {
-                let ty = resolve_type(&ty_name.0);
-                for id in ids {
-                    ty_env.insert(id.clone(), ty);
-                }
+            for d in declarations {
+                let ty =
+                    d.ty_annot
+                        .as_ref()
+                        .map(resolve_type)
+                        .unwrap_or_else(|| match &d.init_expr {
+                            Some(e) => type_of_expr(ty_env, &e),
+                            _ => panic!(
+                            "type error: a variable introduced by `let' must have an initialiser"
+                        ),
+                        });
+                ty_env.insert(d.name.clone(), ty);
             }
             for stmt in body {
                 type_check_stmt(ty_env, stmt);
             }
         }
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
-            for (ty_name, ids) in declarations {
-                let ty = resolve_type(&ty_name.0);
-                for id in ids {
-                    ty_env.insert(id.clone(), ty);
-                }
+            for d in declarations {
+                let ty =
+                    d.ty_annot
+                        .as_ref()
+                        .map(resolve_type)
+                        .unwrap_or_else(|| match &d.init_expr {
+                            Some(e) => type_of_expr(ty_env, &e),
+                            _ => panic!(
+                            "type error: a variable introduced by `let' must have an initialiser"
+                        ),
+                        });
+                ty_env.insert(d.name.clone(), ty);
             }
             for id in situations {
                 ty_env.insert(id.clone(), Type::Integer);
@@ -955,10 +1009,13 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Sym
             load(gen, item);
         }
         Stmt::Block(declarations, body) => {
-            for (_, ids) in declarations {
-                for id in ids {
-                    let idx = gen.add_local();
-                    names.insert(id.clone(), Symbol::Local(idx));
+            for d in declarations {
+                let idx = gen.add_local();
+                names.insert(d.name.clone(), Symbol::Local(idx));
+                if let Some(e) = &d.init_expr {
+                    let item = compile_expr(e, gen, names);
+                    load(gen, item);
+                    gen.emit(OpCode::StLoc(idx));
                 }
             }
             for s in body {
@@ -966,10 +1023,13 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Sym
             }
         }
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
-            for (_, ids) in declarations {
-                for id in ids {
-                    let idx = gen.add_local();
-                    names.insert(id.clone(), Symbol::Local(idx));
+            for d in declarations {
+                let idx = gen.add_local();
+                names.insert(d.name.clone(), Symbol::Local(idx));
+                if let Some(e) = &d.init_expr {
+                    let item = compile_expr(e, gen, names);
+                    load(gen, item);
+                    gen.emit(OpCode::StLoc(idx));
                 }
             }
             let end_lab = gen.new_label();
