@@ -24,7 +24,8 @@ struct Block {
 enum Stmt {
     Expr(Box<Expr>),
     Assign(Box<Expr>, Box<Expr>),
-    If(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
+    IfThenElse(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
+    LoopWhileRepeat(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
 }
 
 #[derive(Debug)]
@@ -85,6 +86,9 @@ enum TokenKind {
     KwThen,
     KwElse,
     KwFi,
+    KwLoop,
+    KwWhile,
+    KwRepeat,
     KwFalse,
     Unknown,
     Eof,
@@ -269,6 +273,9 @@ impl<'a> Scanner<'a> {
         keywords.insert("then", TokenKind::KwThen);
         keywords.insert("else", TokenKind::KwElse);
         keywords.insert("fi", TokenKind::KwFi);
+        keywords.insert("loop", TokenKind::KwLoop);
+        keywords.insert("while", TokenKind::KwWhile);
+        keywords.insert("repeat", TokenKind::KwRepeat);
         keywords.insert("true", TokenKind::KwTrue);
         keywords.insert("false", TokenKind::KwFalse);
         Tokens::new(&mut self.reader, keywords)
@@ -372,7 +379,8 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self) -> Stmt {
         match self.tokens.peek() {
-            Some(tok) if tok.kind == TokenKind::KwIf => self.if_(),
+            Some(tok) if tok.kind == TokenKind::KwIf => self.if_then_else(),
+            Some(tok) if tok.kind == TokenKind::KwLoop => self.loop_while_repeat(),
             _ => {
                 let lhs = self.expr();
                 if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
@@ -383,7 +391,23 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn if_(&mut self) -> Stmt {
+    fn loop_while_repeat(&mut self) -> Stmt {
+        self.expect(TokenKind::KwLoop);
+        let mut s = Vec::new();
+        if !matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwWhile) {
+            s = self.statement_list();
+        }
+        self.expect(TokenKind::KwWhile);
+        let test = self.expr();
+        let mut t = Vec::new();
+        if !matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwRepeat) {
+            t = self.statement_list();
+        }
+        self.expect(TokenKind::KwRepeat);
+        Stmt::LoopWhileRepeat(s, Box::new(test), t)
+    }
+
+    fn if_then_else(&mut self) -> Stmt {
         self.expect(TokenKind::KwIf);
         let test = self.expr();
         self.expect(TokenKind::KwThen);
@@ -394,7 +418,7 @@ impl<'a> Parser<'a> {
             alt = self.statement_list();
         }
         self.expect(TokenKind::KwFi);
-        Stmt::If(Box::new(test), cons, alt)
+        Stmt::IfThenElse(Box::new(test), cons, alt)
     }
 
     fn assignment(&mut self, lhs: Expr) -> Stmt {
@@ -527,15 +551,15 @@ fn type_check_stmt(ty_env: &HashMap<Ident, Type>, stmt: &Stmt) {
                 panic!("type error: trying to assign {:?} to {:?}", rty, lty);
             }
         }
-        Stmt::If(test, cons, alt) => {
-            let cty = type_of_expr(ty_env, test);
-            if cty != Type::Boolean {
-                panic!("type error: if condition must be a boolean value");
+        Stmt::IfThenElse(test, s, t) | Stmt::LoopWhileRepeat(s, test, t) => {
+            let tty = type_of_expr(ty_env, test);
+            if tty != Type::Boolean {
+                panic!("type error: condition must be a boolean value");
             }
-            for stmt in cons {
+            for stmt in s {
                 type_check_stmt(ty_env, stmt);
             }
-            for stmt in alt {
+            for stmt in t {
                 type_check_stmt(ty_env, stmt);
             }
         }
@@ -819,7 +843,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Loc
                 gen.emit(OpCode::StLoc(idx));
             }
         },
-        Stmt::If(test, cons, alt) => {
+        Stmt::IfThenElse(test, cons, alt) => {
             let else_lab = gen.new_label();
             let end_lab = gen.new_label();
             let titem = compile_expr(test, gen, names);
@@ -833,6 +857,22 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Loc
             for stmt in alt {
                 compile_stmt(stmt, gen, names);
             }
+            gen.mark_label(end_lab);
+        }
+        Stmt::LoopWhileRepeat(s, test, t) => {
+            let loop_lab = gen.new_label();
+            let end_lab = gen.new_label();
+            gen.mark_label(loop_lab);
+            for stmt in s {
+                compile_stmt(stmt, gen, names);
+            }
+            let titem = compile_expr(test, gen, names);
+            load(gen, titem);
+            gen.emit(OpCode::BrFalse(end_lab));
+            for stmt in t {
+                compile_stmt(stmt, gen, names);
+            }
+            gen.emit(OpCode::Br(loop_lab));
             gen.mark_label(end_lab);
         }
     }
@@ -936,8 +976,8 @@ fn main() {
         gen.backpatch();
 
         println!("; code:");
-        for op in &gen.code {
-            println!(";   {}", op);
+        for (off, op) in gen.code.iter().enumerate() {
+            println!(";   {:02}: {}", off, op);
         }
 
         let mut vm = Vm::new();
