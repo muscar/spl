@@ -27,9 +27,9 @@ enum Stmt {
     Block(Vec<VarDecl>, Vec<Stmt>),
     Assign(Box<Expr>, Box<Expr>),
     IfThenElse(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
-    BeginUntil(Vec<VarDecl>, Vec<Ident>, Vec<Stmt>, Vec<(Ident, Vec<Stmt>)>),
+    BeginUntil(Vec<VarDecl>, Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
     LoopWhile(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
-    LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Vec<Stmt>)>),
+    LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
 }
 
 #[derive(Debug)]
@@ -503,10 +503,10 @@ impl<'a> Parser<'a> {
         Stmt::LoopUntil(situations, s, handlers)
     }
 
-    fn situation_handler(&mut self) -> (Ident, Vec<Stmt>) {
+    fn situation_handler(&mut self) -> (Ident, Stmt) {
         let situation = self.ident();
         self.expect(TokenKind::FatArrow);
-        let s = self.statement_list();
+        let s = self.statement();
         (situation, s)
     }
 
@@ -629,6 +629,40 @@ impl<'a> Parser<'a> {
 
 // Semantic
 
+struct Env<T: Clone> {
+    scopes: Vec<HashMap<Ident, T>>,
+}
+
+impl<T: Clone> Env<T> {
+    fn new() -> Self {
+        Self { scopes: Vec::new() }
+    }
+
+    fn enter(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn exit(&mut self) {
+        self.scopes.pop().expect("empty scope chain");
+    }
+
+    fn insert(&mut self, id: Ident, value: T) {
+        self.scopes
+            .last_mut()
+            .expect("empty scope chain")
+            .insert(id, value);
+    }
+
+    fn lookup(&self, id: &Ident) -> Option<&T> {
+        for s in self.scopes.iter().rev() {
+            if let x @ Some(_) = s.get(id) {
+                return x;
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Type {
     Boolean,
@@ -645,16 +679,19 @@ fn resolve_type(name: &TypeName) -> Type {
     }
 }
 
-fn type_check(ty_env: &mut HashMap<Ident, Type>, prog: &Program) {
+type TypeEnv = Env<Type>;
+
+fn type_check(ty_env: &mut TypeEnv, prog: &Program) {
     type_check_stmt(ty_env, &prog.body);
 }
 
-fn type_check_stmt(ty_env: &mut HashMap<Ident, Type>, stmt: &Stmt) {
+fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
     match stmt {
         Stmt::Expr(e) => {
             type_of_expr(ty_env, e);
         }
         Stmt::Block(declarations, body) => {
+            ty_env.enter();
             for d in declarations {
                 let ty =
                     d.ty_annot
@@ -671,8 +708,10 @@ fn type_check_stmt(ty_env: &mut HashMap<Ident, Type>, stmt: &Stmt) {
             for stmt in body {
                 type_check_stmt(ty_env, stmt);
             }
+            ty_env.exit();
         }
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
+            ty_env.enter();
             for d in declarations {
                 let ty =
                     d.ty_annot
@@ -697,10 +736,9 @@ fn type_check_stmt(ty_env: &mut HashMap<Ident, Type>, stmt: &Stmt) {
                 if !situations.contains(id) {
                     panic!("type error: situation in handler is not present in loop until declaration: {}", id.0)
                 }
-                for stmt in s {
-                    type_check_stmt(ty_env, stmt);
-                }
+                type_check_stmt(ty_env, s);
             }
+            ty_env.exit();
         }
         Stmt::Assign(lhs, rhs) => {
             let lty = type_of_expr(ty_env, lhs);
@@ -714,17 +752,23 @@ fn type_check_stmt(ty_env: &mut HashMap<Ident, Type>, stmt: &Stmt) {
             if tty != Type::Boolean {
                 panic!("type error: condition must be a boolean value");
             }
+            ty_env.enter();
             for stmt in s {
                 type_check_stmt(ty_env, stmt);
             }
+            ty_env.exit();
+            ty_env.enter();
             for stmt in t {
                 type_check_stmt(ty_env, stmt);
             }
+            ty_env.exit();
         }
         Stmt::LoopUntil(situations, s, handlers) => {
+            ty_env.enter();
             for id in situations {
                 ty_env.insert(id.clone(), Type::Integer);
             }
+            ty_env.enter();
             for stmt in s {
                 type_check_stmt(ty_env, stmt);
             }
@@ -733,20 +777,20 @@ fn type_check_stmt(ty_env: &mut HashMap<Ident, Type>, stmt: &Stmt) {
                 if !situations.contains(id) {
                     panic!("type error: situation in handler is not present in loop until declaration: {}", id.0)
                 }
-                for stmt in s {
-                    type_check_stmt(ty_env, stmt);
-                }
+                type_check_stmt(ty_env, s);
             }
+            ty_env.exit();
+            ty_env.exit();
         }
     };
 }
 
-fn type_of_expr(ty_env: &HashMap<Ident, Type>, expr: &Expr) -> Type {
+fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
     match expr {
         &Expr::BoolLit(_) => Type::Boolean,
         Expr::IntLit(_) => Type::Integer,
         Expr::Ident(id) => ty_env
-            .get(id)
+            .lookup(id)
             .copied()
             .unwrap_or_else(|| panic!("unbound identifier `{}'", id.0)),
         Expr::UnOp(op, arg) => {
@@ -984,11 +1028,13 @@ impl Vm {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Clone, Hash)]
 enum Symbol {
     Local(LocalIdx),
     Situation(LabelIdx),
 }
+
+type SymTab = Env<Symbol>;
 
 #[derive(Clone, Copy)]
 enum Item {
@@ -998,36 +1044,47 @@ enum Item {
 }
 
 fn compile(prog: &Program, gen: &mut CodeBlock) {
-    let mut names = HashMap::new();
-    compile_stmt(&prog.body, gen, &mut names);
+    let mut symtab = SymTab::new();
+    compile_stmt(&prog.body, gen, &mut symtab);
 }
 
-fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Symbol>) {
+fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
     match stmt {
         Stmt::Expr(e) => {
-            let item = compile_expr(e, gen, names);
+            let item = compile_expr(e, gen, symtab);
             load(gen, item);
         }
+        Stmt::Assign(lhs, rhs) => match compile_expr(lhs, gen, symtab) {
+            Item::Imm(_) | Item::Stack => panic!("trying to assign to value on stack! bug?"),
+            Item::Local(idx) => {
+                let item = compile_expr(rhs, gen, symtab);
+                load(gen, item);
+                gen.emit(OpCode::StLoc(idx));
+            }
+        },
         Stmt::Block(declarations, body) => {
+            symtab.enter();
             for d in declarations {
                 let idx = gen.add_local();
-                names.insert(d.name.clone(), Symbol::Local(idx));
+                symtab.insert(d.name.clone(), Symbol::Local(idx));
                 if let Some(e) = &d.init_expr {
-                    let item = compile_expr(e, gen, names);
+                    let item = compile_expr(e, gen, symtab);
                     load(gen, item);
                     gen.emit(OpCode::StLoc(idx));
                 }
             }
             for s in body {
-                compile_stmt(s, gen, names);
+                compile_stmt(s, gen, symtab);
             }
+            symtab.exit();
         }
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
+            symtab.enter();
             for d in declarations {
                 let idx = gen.add_local();
-                names.insert(d.name.clone(), Symbol::Local(idx));
+                symtab.insert(d.name.clone(), Symbol::Local(idx));
                 if let Some(e) = &d.init_expr {
-                    let item = compile_expr(e, gen, names);
+                    let item = compile_expr(e, gen, symtab);
                     load(gen, item);
                     gen.emit(OpCode::StLoc(idx));
                 }
@@ -1036,11 +1093,11 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Sym
             let mut situation_labs = HashMap::new();
             for id in situations {
                 let lab = gen.new_label();
-                names.insert(id.clone(), Symbol::Situation(lab));
+                symtab.insert(id.clone(), Symbol::Situation(lab));
                 situation_labs.insert(id.clone(), lab);
             }
             for stmt in s {
-                compile_stmt(stmt, gen, names);
+                compile_stmt(stmt, gen, symtab);
             }
             for (id, s) in handlers {
                 gen.mark_label(
@@ -1048,49 +1105,44 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Sym
                         .get(id)
                         .expect("unknown situation label. bug?"),
                 );
-                for stmt in s {
-                    compile_stmt(stmt, gen, names);
-                }
+                compile_stmt(s, gen, symtab);
                 gen.emit(OpCode::Br(end_lab));
             }
             gen.mark_label(end_lab);
+            symtab.exit();
         }
-        Stmt::Assign(lhs, rhs) => match compile_expr(lhs, gen, names) {
-            Item::Imm(_) | Item::Stack => panic!("trying to assign to value on stack! bug?"),
-            Item::Local(idx) => {
-                let item = compile_expr(rhs, gen, names);
-                load(gen, item);
-                gen.emit(OpCode::StLoc(idx));
-            }
-        },
         Stmt::IfThenElse(test, cons, alt) => {
             let else_lab = gen.new_label();
             let end_lab = gen.new_label();
-            let titem = compile_expr(test, gen, names);
+            let titem = compile_expr(test, gen, symtab);
             load(gen, titem);
             gen.emit(OpCode::BrFalse(else_lab));
+            symtab.enter();
             for stmt in cons {
-                compile_stmt(stmt, gen, names);
+                compile_stmt(stmt, gen, symtab);
             }
             gen.emit(OpCode::Br(end_lab));
+            symtab.exit();
+            symtab.enter();
             gen.mark_label(else_lab);
             for stmt in alt {
-                compile_stmt(stmt, gen, names);
+                compile_stmt(stmt, gen, symtab);
             }
             gen.mark_label(end_lab);
+            symtab.enter();
         }
         Stmt::LoopWhile(s, test, t) => {
             let loop_lab = gen.new_label();
             let end_lab = gen.new_label();
             gen.mark_label(loop_lab);
             for stmt in s {
-                compile_stmt(stmt, gen, names);
+                compile_stmt(stmt, gen, symtab);
             }
-            let titem = compile_expr(test, gen, names);
+            let titem = compile_expr(test, gen, symtab);
             load(gen, titem);
             gen.emit(OpCode::BrFalse(end_lab));
             for stmt in t {
-                compile_stmt(stmt, gen, names);
+                compile_stmt(stmt, gen, symtab);
             }
             gen.emit(OpCode::Br(loop_lab));
             gen.mark_label(end_lab);
@@ -1099,14 +1151,16 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Sym
             let loop_lab = gen.new_label();
             let end_lab = gen.new_label();
             let mut situation_labs = HashMap::new();
+            symtab.enter();
             for id in situations {
                 let lab = gen.new_label();
-                names.insert(id.clone(), Symbol::Situation(lab));
+                symtab.insert(id.clone(), Symbol::Situation(lab));
                 situation_labs.insert(id.clone(), lab);
             }
+            symtab.enter();
             gen.mark_label(loop_lab);
             for stmt in s {
-                compile_stmt(stmt, gen, names);
+                compile_stmt(stmt, gen, symtab);
             }
             gen.emit(OpCode::Br(loop_lab));
             for (id, s) in handlers {
@@ -1115,23 +1169,23 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, names: &mut HashMap<Ident, Sym
                         .get(id)
                         .expect("unknown situation label. bug?"),
                 );
-                for stmt in s {
-                    compile_stmt(stmt, gen, names);
-                }
+                compile_stmt(s, gen, symtab);
                 gen.emit(OpCode::Br(end_lab));
             }
             gen.mark_label(end_lab);
+            symtab.exit();
+            symtab.exit();
         }
     }
 }
 
-fn compile_expr(expr: &Expr, gen: &mut CodeBlock, names: &HashMap<Ident, Symbol>) -> Item {
+fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
     match expr {
         Expr::BoolLit(b) => Item::Imm(if *b { 1 } else { 0 }),
         Expr::IntLit(n) => Item::Imm(*n),
         Expr::Ident(id) => {
-            let sym = names
-                .get(id)
+            let sym = symtab
+                .lookup(id)
                 .unwrap_or_else(|| panic!("unbound identifier: {}", id.0));
             match sym {
                 Symbol::Local(idx) => Item::Local(*idx),
@@ -1143,7 +1197,7 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, names: &HashMap<Ident, Symbol>
             }
         }
         Expr::UnOp(op, arg) => {
-            let aitem = compile_expr(arg, gen, names);
+            let aitem = compile_expr(arg, gen, symtab);
             match aitem {
                 Item::Imm(n) => match op {
                     UnOp::Not => Item::Imm(if n == 0 { 1 } else { 0 }),
@@ -1158,8 +1212,8 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, names: &HashMap<Ident, Symbol>
             }
         }
         Expr::BinOp(op, lhs, rhs) => {
-            let litem = compile_expr(lhs, gen, names);
-            let ritem = compile_expr(rhs, gen, names);
+            let litem = compile_expr(lhs, gen, symtab);
+            let ritem = compile_expr(rhs, gen, symtab);
             match (litem, ritem) {
                 (Item::Imm(m), Item::Imm(n)) => match op {
                     BinOp::Plus => Item::Imm(m + n),
@@ -1215,7 +1269,7 @@ fn compile_and_run(s: &str) {
     let node = p.parse();
     println!("; {:?}", node);
 
-    let mut ty_env = HashMap::new();
+    let mut ty_env = TypeEnv::new();
     type_check(&mut ty_env, &node);
 
     let mut gen = CodeBlock::new();
