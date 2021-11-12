@@ -1,7 +1,6 @@
 begin
-  integer x;
+  integer x := 10;
   boolean success;
-  x := 10;
   begin until yay or uhoh
     if x = 0 then yay else uhoh fi
   end

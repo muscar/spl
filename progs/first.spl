@@ -1,7 +1,6 @@
 begin
-  integer x;
+  integer x := 4;
   boolean success;
-  x := 4;
   loop until found or error
     if x > 5 then
       x := x - 1

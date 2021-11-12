@@ -1,0 +1,17 @@
+begin
+  integer target := ARGS[0];
+  integer n := ARGS[1];
+  integer i := 2;
+  boolean success := false;
+
+  loop until found or done
+    if ARGS[i] = target then found
+    else if i <= n then i := i + 1 else done fi
+    fi
+  repeat
+  then
+    found => success := true
+    done => skip
+  fi;
+  success
+end.

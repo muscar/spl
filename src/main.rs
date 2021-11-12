@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     fs,
     io::{self, Write},
-    iter::{self, Peekable},
+    iter::Peekable,
     str::Chars,
 };
 
@@ -14,7 +14,10 @@ use std::{
 struct Ident(String);
 
 #[derive(Debug, Clone)]
-struct TypeName(String);
+enum TypeAnnot {
+    TypeName(String),
+    Array(Box<TypeAnnot>, usize),
+}
 
 #[derive(Debug)]
 struct Program {
@@ -23,6 +26,7 @@ struct Program {
 
 #[derive(Debug)]
 enum Stmt {
+    Skip,
     Expr(Box<Expr>),
     Block(Vec<VarDecl>, Vec<Stmt>),
     Assign(Box<Expr>, Box<Expr>),
@@ -36,7 +40,7 @@ enum Stmt {
 #[derive(Debug)]
 struct VarDecl {
     name: Ident,
-    ty_annot: Option<TypeName>,
+    ty_annot: Option<TypeAnnot>,
     init_expr: Option<Expr>,
 }
 
@@ -45,6 +49,7 @@ enum Expr {
     BoolLit(bool),
     IntLit(i64),
     Ident(Ident),
+    Subscript(Box<Expr>, Box<Expr>),
     UnOp(UnOp, Box<Expr>),
     BinOp(BinOp, Box<Expr>, Box<Expr>),
 }
@@ -89,9 +94,12 @@ enum TokenKind {
     Colon,
     LPar,
     RPar,
+    LBrack,
+    RBrack,
     KwBoolean,
     KwInteger,
     KwString,
+    KwArray,
     KwLet,
     KwBegin,
     KwEnd,
@@ -103,6 +111,7 @@ enum TokenKind {
     KwWhile,
     KwRepeat,
     KwUntil,
+    KwSkip,
     KwOr,
     KwTrue,
     KwFalse,
@@ -217,7 +226,12 @@ impl<'a> Iterator for Tokens<'a> {
             }
             Some('~') => {
                 token.text.push(self.reader.read().unwrap());
-                TokenKind::Tilde
+                if self.reader.peek() == Some('=') {
+                    token.text.push(self.reader.read().unwrap());
+                    TokenKind::Neq
+                } else {
+                    TokenKind::Tilde
+                }
             }
             Some(',') => {
                 token.text.push(self.reader.read().unwrap());
@@ -247,6 +261,14 @@ impl<'a> Iterator for Tokens<'a> {
             Some(')') => {
                 token.text.push(self.reader.read().unwrap());
                 TokenKind::RPar
+            }
+            Some('[') => {
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::LBrack
+            }
+            Some(']') => {
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::RBrack
             }
             Some(c) if c.is_digit(10) => {
                 while matches!(self.reader.peek(), Some(c) if c.is_digit(10)) {
@@ -289,6 +311,7 @@ impl<'a> Scanner<'a> {
 
     fn scan(&'a mut self) -> Tokens<'a> {
         let mut keywords = HashMap::new();
+        keywords.insert("array", TokenKind::KwArray);
         keywords.insert("boolean", TokenKind::KwBoolean);
         keywords.insert("integer", TokenKind::KwInteger);
         keywords.insert("string", TokenKind::KwString);
@@ -303,6 +326,7 @@ impl<'a> Scanner<'a> {
         keywords.insert("while", TokenKind::KwWhile);
         keywords.insert("repeat", TokenKind::KwRepeat);
         keywords.insert("until", TokenKind::KwUntil);
+        keywords.insert("skip", TokenKind::KwSkip);
         keywords.insert("or", TokenKind::KwOr);
         keywords.insert("true", TokenKind::KwTrue);
         keywords.insert("false", TokenKind::KwFalse);
@@ -360,6 +384,20 @@ impl<'a> Parser<'a> {
         Ident(self.expect(TokenKind::Ident))
     }
 
+    fn type_annot(&mut self) -> TypeAnnot {
+        let ty_name = TypeAnnot::TypeName(self.tokens.next().unwrap().text);
+        match self.tokens.peek() {
+            Some(Token {
+                kind: TokenKind::KwArray,
+                ..
+            }) => {
+                self.tokens.next();
+                TypeAnnot::Array(Box::new(ty_name), 0)
+            }
+            _ => ty_name,
+        }
+    }
+
     // ident_list ::= Ident {',' Ident}
     fn ident_list(&mut self, sep: TokenKind) -> Vec<Ident> {
         let mut idents = vec![self.ident()];
@@ -391,6 +429,10 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self) -> Stmt {
         match self.tokens.peek() {
+            Some(tok) if tok.kind == TokenKind::KwSkip => {
+                self.tokens.next();
+                Stmt::Skip
+            }
             Some(tok) if tok.kind == TokenKind::KwBegin => self.block_dispatch(),
             Some(tok) if tok.kind == TokenKind::KwIf => self.if_then_else(),
             Some(tok) if tok.kind == TokenKind::KwLoop => self.loop_dispatch(),
@@ -422,8 +464,8 @@ impl<'a> Parser<'a> {
 
     fn begin_until(&mut self) -> Stmt {
         self.expect(TokenKind::KwUntil);
-        let declarations = self.var_decls();
         let situations = self.ident_list(TokenKind::KwOr);
+        let declarations = self.var_decls();
         let s = self.statement_list();
         self.expect(TokenKind::KwEnd);
         self.expect(TokenKind::KwThen);
@@ -441,14 +483,23 @@ impl<'a> Parser<'a> {
             self.tokens.peek(),
             Some(tok) if Self::is_builtin_type_name(tok) || tok.kind == TokenKind::KwLet
         ) {
-            let ty_annot = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwLet)
+            let mut ty_annot = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwLet)
             {
                 self.tokens.next();
                 None
             } else {
-                Some(TypeName(self.tokens.next().unwrap().text))
+                Some(self.type_annot())
             };
             let name = self.ident();
+            if let Some(TypeAnnot::Array(base_type, _)) = ty_annot {
+                self.expect(TokenKind::LBrack);
+                let dim = self
+                    .expect(TokenKind::IntLit)
+                    .parse()
+                    .expect("array dimensions must be integer literals");
+                ty_annot = Some(TypeAnnot::Array(base_type, dim));
+                self.expect(TokenKind::RBrack);
+            }
             let init_expr = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes)
             {
                 self.tokens.next();
@@ -634,7 +685,16 @@ impl<'a> Parser<'a> {
             TokenKind::KwTrue => Expr::BoolLit(true),
             TokenKind::KwFalse => Expr::BoolLit(false),
             TokenKind::IntLit => Expr::IntLit(tok.text.parse().expect("malformed integer literal")),
-            TokenKind::Ident => Expr::Ident(Ident(tok.text)),
+            TokenKind::Ident => {
+                let id = Expr::Ident(Ident(tok.text));
+                if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::LBrack) {
+                    self.tokens.next();
+                    let sub = self.expr();
+                    self.expect(TokenKind::RBrack);
+                    return Expr::Subscript(Box::new(id), Box::new(sub));
+                }
+                id
+            }
             TokenKind::Tilde => Expr::UnOp(UnOp::Not, Box::new(self.expr())),
             TokenKind::LPar => {
                 let expr = self.expr();
@@ -682,46 +742,62 @@ impl<T: Clone> Env<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Type {
     Boolean,
     Integer,
     String,
+    Array(Box<Type>),
 }
 
-fn resolve_type(name: &TypeName) -> Type {
-    match &name.0[..] {
+fn resolve_type(name: &str) -> Type {
+    match name {
         "boolean" => Type::Boolean,
         "integer" => Type::Integer,
         "string" => Type::String,
-        _ => panic!("type error: unknown type {}", name.0),
+        _ => panic!("type error: unknown type {}", name),
+    }
+}
+
+fn resolve_type_annot(name: &TypeAnnot) -> Type {
+    match name {
+        TypeAnnot::TypeName(ty_name) => resolve_type(&ty_name[..]),
+        TypeAnnot::Array(base_ty, _) => Type::Array(Box::new(resolve_type_annot(base_ty))),
     }
 }
 
 type TypeEnv = Env<Type>;
 
 fn type_check(ty_env: &mut TypeEnv, prog: &Program) {
+    // TODO: gross hack
+    ty_env.enter();
+    ty_env.insert(
+        Ident("ARGS".to_string()),
+        Type::Array(Box::new(Type::Integer)),
+    );
     type_check_stmt(ty_env, &prog.body);
+    ty_env.exit();
 }
 
 fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
     match stmt {
+        Stmt::Skip => (),
         Stmt::Expr(e) => {
             type_of_expr(ty_env, e);
         }
         Stmt::Block(declarations, body) => {
             ty_env.enter();
             for d in declarations {
-                let ty =
-                    d.ty_annot
-                        .as_ref()
-                        .map(resolve_type)
-                        .unwrap_or_else(|| match &d.init_expr {
-                            Some(e) => type_of_expr(ty_env, &e),
-                            _ => panic!(
+                let ty = d
+                    .ty_annot
+                    .as_ref()
+                    .map(resolve_type_annot)
+                    .unwrap_or_else(|| match &d.init_expr {
+                        Some(e) => type_of_expr(ty_env, e),
+                        _ => panic!(
                             "type error: a variable introduced by `let' must have an initialiser"
                         ),
-                        });
+                    });
                 ty_env.insert(d.name.clone(), ty);
             }
             for stmt in body {
@@ -732,16 +808,16 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
             ty_env.enter();
             for d in declarations {
-                let ty =
-                    d.ty_annot
-                        .as_ref()
-                        .map(resolve_type)
-                        .unwrap_or_else(|| match &d.init_expr {
-                            Some(e) => type_of_expr(ty_env, &e),
-                            _ => panic!(
+                let ty = d
+                    .ty_annot
+                    .as_ref()
+                    .map(resolve_type_annot)
+                    .unwrap_or_else(|| match &d.init_expr {
+                        Some(e) => type_of_expr(ty_env, e),
+                        _ => panic!(
                             "type error: a variable introduced by `let' must have an initialiser"
                         ),
-                        });
+                    });
                 ty_env.insert(d.name.clone(), ty);
             }
             for id in situations {
@@ -830,8 +906,19 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
         Expr::IntLit(_) => Type::Integer,
         Expr::Ident(id) => ty_env
             .lookup(id)
-            .copied()
+            .cloned()
             .unwrap_or_else(|| panic!("unbound identifier `{}'", id.0)),
+        Expr::Subscript(target, sub) => {
+            let tty = type_of_expr(ty_env, target);
+            let sty = type_of_expr(ty_env, sub);
+            if sty != Type::Integer {
+                panic!("type error: array subscripts must have integer type");
+            }
+            match tty {
+                Type::Array(ty) => *ty,
+                _ => panic!("type error: only arrays can be subscripted"),
+            }
+        }
         Expr::UnOp(op, arg) => {
             let aty = type_of_expr(ty_env, arg);
             match op {
@@ -872,7 +959,7 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
 
 // Compiler + VM
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LocalIdx(usize);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -883,13 +970,14 @@ enum OpCode {
     LdcI8(i64),
     LdLoc(LocalIdx),
     StLoc(LocalIdx),
+    LdElem,
+    StElem,
     Not,
     Add,
     Sub,
     Eq,
     Lt,
     Gt,
-    Ret,
     Br(LabelIdx),
     BrFalse(LabelIdx),
     Nop,
@@ -901,6 +989,8 @@ impl Display for OpCode {
             OpCode::LdcI8(n) => f.write_fmt(format_args!("ldc.i8 {}", n)),
             OpCode::LdLoc(idx) => f.write_fmt(format_args!("ldloc {}", idx.0)),
             OpCode::StLoc(idx) => f.write_fmt(format_args!("stloc {}", idx.0)),
+            OpCode::LdElem => f.write_fmt(format_args!("ldelem")),
+            OpCode::StElem => f.write_fmt(format_args!("stelem")),
             OpCode::Not => f.write_str("not"),
             OpCode::Add => f.write_str("add"),
             OpCode::Sub => f.write_str("sub"),
@@ -909,7 +999,6 @@ impl Display for OpCode {
             OpCode::Gt => f.write_str("gt"),
             OpCode::Br(lab) => f.write_fmt(format_args!("br {}", lab.0)),
             OpCode::BrFalse(lab) => f.write_fmt(format_args!("br.false {}", lab.0)),
-            OpCode::Ret => f.write_str("ret"),
             OpCode::Nop => f.write_str("nop"),
         }
     }
@@ -932,9 +1021,9 @@ impl CodeBlock {
         }
     }
 
-    fn add_local(&mut self) -> LocalIdx {
+    fn add_local(&mut self, size: usize) -> LocalIdx {
         let idx = LocalIdx(self.next_local_idx);
-        self.next_local_idx += 1;
+        self.next_local_idx += size;
         idx
     }
 
@@ -994,9 +1083,13 @@ impl Vm {
         }
     }
 
-    fn run(&mut self, gen: &CodeBlock) -> i64 {
+    fn run(&mut self, gen: &CodeBlock, args: &[i64]) -> i64 {
         self.call_stack
             .push(ActivationRecord::new(gen.next_local_idx));
+        // TODO: gross hack
+        for (i, arg) in args.iter().enumerate() {
+            self.call_stack[0].locals[i] = *arg;
+        }
         let mut ip = 0;
         while ip < gen.code.len() {
             match gen.code[ip] {
@@ -1012,6 +1105,21 @@ impl Vm {
                 OpCode::StLoc(idx) => {
                     let arec = self.call_stack.last_mut().unwrap();
                     arec.locals[idx.0] = self.stack.pop().expect("stack underflow");
+                    ip += 1;
+                }
+                OpCode::LdElem => {
+                    let base_off = self.stack.pop().expect("stack underflow");
+                    let idx = self.stack.pop().expect("stack underflow");
+                    self.stack
+                        .push(self.call_stack.last().unwrap().locals[(base_off + idx) as usize]);
+                    ip += 1;
+                }
+                OpCode::StElem => {
+                    let arec = self.call_stack.last_mut().unwrap();
+                    let x = self.stack.pop().expect("stack underflow");
+                    let base_off = self.stack.pop().expect("stack underflow");
+                    let idx = self.stack.pop().expect("stack underflow");
+                    arec.locals[(base_off + idx) as usize] = x;
                     ip += 1;
                 }
                 OpCode::Not => {
@@ -1059,7 +1167,6 @@ impl Vm {
                     }
                 }
                 OpCode::Nop => ip += 1,
-                OpCode::Ret => break,
             }
         }
         self.call_stack.pop();
@@ -1070,25 +1177,35 @@ impl Vm {
 #[derive(PartialEq, Eq, Clone, Hash)]
 enum Symbol {
     Local(LocalIdx),
+    LocalArray(LocalIdx, usize),
     Situation(LabelIdx),
 }
 
 type SymTab = Env<Symbol>;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Item {
-    Imm(i64),
     Stack,
+    Imm(i64),
     Local(LocalIdx),
+    ArrayElem(LocalIdx),
 }
 
 fn compile(prog: &Program, gen: &mut CodeBlock) {
     let mut symtab = SymTab::new();
+    symtab.enter();
+    // TODO: gross hack
+    symtab.insert(
+        Ident("ARGS".to_string()),
+        Symbol::LocalArray(LocalIdx(0), 0),
+    );
     compile_stmt(&prog.body, gen, &mut symtab);
+    symtab.exit();
 }
 
 fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
     match stmt {
+        Stmt::Skip => gen.emit(OpCode::Nop),
         Stmt::Expr(e) => {
             let item = compile_expr(e, gen, symtab);
             load(gen, item);
@@ -1100,12 +1217,27 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
                 load(gen, item);
                 gen.emit(OpCode::StLoc(idx));
             }
+            Item::ArrayElem(_) => {
+                let item = compile_expr(rhs, gen, symtab);
+                load(gen, item);
+                gen.emit(OpCode::StElem);
+            }
         },
         Stmt::Block(declarations, body) => {
             symtab.enter();
             for d in declarations {
-                let idx = gen.add_local();
-                symtab.insert(d.name.clone(), Symbol::Local(idx));
+                let idx = match d.ty_annot {
+                    Some(TypeAnnot::Array(_, dim)) => {
+                        let idx = gen.add_local(dim);
+                        symtab.insert(d.name.clone(), Symbol::LocalArray(idx, dim));
+                        idx
+                    }
+                    _ => {
+                        let idx = gen.add_local(1);
+                        symtab.insert(d.name.clone(), Symbol::Local(idx));
+                        idx
+                    } // TODO: not correct
+                };
                 if let Some(e) = &d.init_expr {
                     let item = compile_expr(e, gen, symtab);
                     load(gen, item);
@@ -1120,8 +1252,18 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
             symtab.enter();
             for d in declarations {
-                let idx = gen.add_local();
-                symtab.insert(d.name.clone(), Symbol::Local(idx));
+                let idx = match d.ty_annot {
+                    Some(TypeAnnot::Array(_, dim)) => {
+                        let idx = gen.add_local(dim);
+                        symtab.insert(d.name.clone(), Symbol::LocalArray(idx, dim));
+                        idx
+                    }
+                    _ => {
+                        let idx = gen.add_local(1);
+                        symtab.insert(d.name.clone(), Symbol::Local(idx));
+                        idx
+                    } // TODO: not correct
+                };
                 if let Some(e) = &d.init_expr {
                     let item = compile_expr(e, gen, symtab);
                     load(gen, item);
@@ -1265,11 +1407,27 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
                 .unwrap_or_else(|| panic!("unbound identifier: {}", id.0));
             match sym {
                 Symbol::Local(idx) => Item::Local(*idx),
+                Symbol::LocalArray(idx, _) => Item::ArrayElem(*idx),
                 Symbol::Situation(lab) => {
                     gen.emit(OpCode::Br(*lab));
                     // TODO: Is this right?
                     Item::Stack
                 }
+            }
+        }
+        Expr::Subscript(target, sub) => {
+            let titem = compile_expr(target, gen, symtab);
+            let sitem = compile_expr(sub, gen, symtab);
+            match (titem, sitem) {
+                (Item::ArrayElem(base_off), Item::Imm(idx)) => {
+                    Item::Local(LocalIdx(base_off.0 + idx as usize))
+                }
+                (Item::ArrayElem(base_off), _) => {
+                    load(gen, sitem);
+                    gen.emit(OpCode::LdcI8(base_off.0 as i64));
+                    titem
+                }
+                _ => panic!("{:?} {:?}", titem, sitem),
             }
         }
         Expr::UnOp(op, arg) => {
@@ -1334,21 +1492,25 @@ fn load(gen: &mut CodeBlock, item: Item) {
     match item {
         Item::Imm(n) => gen.emit(OpCode::LdcI8(n)),
         Item::Local(idx) => gen.emit(OpCode::LdLoc(idx)),
+        Item::ArrayElem(_) => {
+            gen.emit(OpCode::LdElem);
+        }
         Item::Stack => (),
     }
 }
 
-fn compile_and_run(s: &str) {
+fn compile_and_run(s: &str, args: &[i64]) {
     let sr = SourceReader::new(s);
     let mut s = Scanner::new(sr);
     let mut p = Parser::new(s.scan());
     let node = p.parse();
-    println!("; {:?}", node);
 
     let mut ty_env = TypeEnv::new();
     type_check(&mut ty_env, &node);
 
     let mut gen = CodeBlock::new();
+    // TODO: gross hack
+    gen.next_local_idx = args.len();
     compile(&node, &mut gen);
     gen.backpatch();
 
@@ -1358,10 +1520,10 @@ fn compile_and_run(s: &str) {
     }
 
     let mut vm = Vm::new();
-    println!("; {:?}", vm.run(&gen));
+    println!("; {:?}", vm.run(&gen, args));
 }
 
-fn repl() {
+fn repl(args: &[i64]) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut buf = String::new();
@@ -1369,17 +1531,42 @@ fn repl() {
         stdout.write_all(b"> ").unwrap();
         stdout.flush().unwrap();
         stdin.read_line(&mut buf).unwrap();
-        compile_and_run(&buf);
+        compile_and_run(&buf, args);
         buf.clear();
     }
 }
 
+#[derive(Debug)]
+struct Options {
+    source_file: Option<String>,
+    args: Vec<i64>,
+}
+
+fn parse_args() -> Options {
+    let mut args = env::args().skip(1);
+    let mut source_file = None;
+    while let Some(arg) = args.next() {
+        if arg == "-f" {
+            source_file = args.next();
+        }
+        if arg == "--" {
+            break;
+        }
+    }
+    Options {
+        source_file,
+        args: args
+            .map(|s| s.parse().expect("script args must be integers"))
+            .collect::<Vec<i64>>(),
+    }
+}
+
 fn main() {
-    let args = env::args().skip(1).collect::<Vec<String>>();
-    if args.is_empty() {
-        repl();
+    let opts = parse_args();
+    if let Some(s) = opts.source_file {
+        let s = fs::read_to_string(&s).expect("could not read source file");
+        compile_and_run(&s, opts.args.as_slice());
     } else {
-        let s = fs::read_to_string(&args[0]).expect("could not read source file");
-        compile_and_run(&s);
+        repl(opts.args.as_slice());
     }
 }
