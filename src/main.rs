@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     fs,
     io::{self, Write},
-    iter::Peekable,
+    iter::{self, Peekable},
     str::Chars,
 };
 
@@ -30,6 +30,7 @@ enum Stmt {
     BeginUntil(Vec<VarDecl>, Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
     LoopWhile(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
     LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
+    WhileElseIf(Box<Expr>, Vec<Stmt>, Vec<(Expr, Vec<Stmt>)>),
 }
 
 #[derive(Debug)]
@@ -393,6 +394,7 @@ impl<'a> Parser<'a> {
             Some(tok) if tok.kind == TokenKind::KwBegin => self.block_dispatch(),
             Some(tok) if tok.kind == TokenKind::KwIf => self.if_then_else(),
             Some(tok) if tok.kind == TokenKind::KwLoop => self.loop_dispatch(),
+            Some(tok) if tok.kind == TokenKind::KwWhile => self.while_else_if(),
             _ => {
                 let lhs = self.expr();
                 if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
@@ -523,6 +525,23 @@ impl<'a> Parser<'a> {
         }
         self.expect(TokenKind::KwRepeat);
         Stmt::LoopWhile(s, Box::new(test), t)
+    }
+
+    fn while_else_if(&mut self) -> Stmt {
+        self.expect(TokenKind::KwWhile);
+        let test = self.expr();
+        let s = self.statement_list();
+        let mut alts = Vec::new();
+        while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwElse) {
+            self.expect(TokenKind::KwElse);
+            self.expect(TokenKind::KwIf);
+            let test = self.expr();
+            self.expect(TokenKind::KwThen);
+            let t = self.statement_list();
+            alts.push((test, t));
+        }
+        self.expect(TokenKind::KwFi);
+        Stmt::WhileElseIf(Box::new(test), s, alts)
     }
 
     fn if_then_else(&mut self) -> Stmt {
@@ -780,6 +799,26 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
                 type_check_stmt(ty_env, s);
             }
             ty_env.exit();
+            ty_env.exit();
+        }
+        Stmt::WhileElseIf(test, s, alts) => {
+            let tty = type_of_expr(ty_env, test);
+            if tty != Type::Boolean {
+                panic!("type error: condition must be a boolean value");
+            }
+            ty_env.enter();
+            for stmt in s {
+                type_check_stmt(ty_env, stmt);
+            }
+            for (atest, ablock) in alts {
+                let atty = type_of_expr(ty_env, atest);
+                if atty != Type::Boolean {
+                    panic!("type error: condition must be a boolean value");
+                }
+                for stmt in ablock {
+                    type_check_stmt(ty_env, stmt);
+                }
+            }
             ty_env.exit();
         }
     };
@@ -1129,7 +1168,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
                 compile_stmt(stmt, gen, symtab);
             }
             gen.mark_label(end_lab);
-            symtab.enter();
+            symtab.exit();
         }
         Stmt::LoopWhile(s, test, t) => {
             let loop_lab = gen.new_label();
@@ -1175,6 +1214,43 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
             gen.mark_label(end_lab);
             symtab.exit();
             symtab.exit();
+        }
+        Stmt::WhileElseIf(test, s, alts) => {
+            let loop_lab = gen.new_label();
+            let end_lab = gen.new_label();
+            let mut alt_labs = Vec::new();
+            for _ in 0..alts.len() {
+                alt_labs.push(gen.new_label());
+            }
+            alt_labs.push(end_lab);
+            let mut next_lab_idx = 0;
+
+            gen.mark_label(loop_lab);
+            symtab.enter();
+            let titem = compile_expr(test, gen, symtab);
+            load(gen, titem);
+            gen.emit(OpCode::BrFalse(alt_labs[next_lab_idx]));
+            for stmt in s {
+                compile_stmt(stmt, gen, symtab);
+            }
+            gen.emit(OpCode::Br(loop_lab));
+            symtab.exit();
+
+            for (atest, ablock) in alts {
+                gen.mark_label(alt_labs[next_lab_idx]);
+                next_lab_idx += 1;
+                symtab.enter();
+                let titem = compile_expr(atest, gen, symtab);
+                load(gen, titem);
+                gen.emit(OpCode::BrFalse(end_lab));
+                for stmt in ablock {
+                    compile_stmt(stmt, gen, symtab);
+                }
+                gen.emit(OpCode::Br(loop_lab));
+                symtab.exit();
+            }
+
+            gen.mark_label(end_lab);
         }
     }
 }
