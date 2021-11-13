@@ -757,7 +757,7 @@ enum Type {
     Boolean,
     Integer,
     String,
-    Array(Box<Type>),
+    Array(Box<Type>, Option<usize>),
 }
 
 fn resolve_type(name: &str) -> Type {
@@ -772,7 +772,9 @@ fn resolve_type(name: &str) -> Type {
 fn resolve_type_annot(name: &TypeAnnot) -> Type {
     match name {
         TypeAnnot::TypeName(ty_name) => resolve_type(&ty_name[..]),
-        TypeAnnot::Array(base_ty, _) => Type::Array(Box::new(resolve_type_annot(base_ty))),
+        TypeAnnot::Array(base_ty, size) => {
+            Type::Array(Box::new(resolve_type_annot(base_ty)), Some(*size))
+        }
     }
 }
 
@@ -783,7 +785,7 @@ fn type_check(ty_env: &mut TypeEnv, prog: &Program) {
     ty_env.enter();
     ty_env.insert(
         Ident("ARGS".to_string()),
-        Type::Array(Box::new(Type::Integer)),
+        Type::Array(Box::new(Type::Integer), None),
     );
     type_check_stmt(ty_env, &prog.body);
     ty_env.exit();
@@ -795,20 +797,29 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         Stmt::Expr(e) => {
             type_of_expr(ty_env, e);
         }
-        // TODO: check initialiser types match the variable types
         Stmt::Block(declarations, body) => {
             ty_env.enter();
             for d in declarations {
-                let ty = d
-                    .ty_annot
-                    .as_ref()
-                    .map(resolve_type_annot)
-                    .unwrap_or_else(|| match &d.init_expr {
-                        Some(e) => type_of_expr(ty_env, e),
-                        _ => panic!(
-                            "type error: a variable introduced by `let' must have an initialiser"
-                        ),
-                    });
+                let var_ty = d.ty_annot.as_ref().map(resolve_type_annot);
+                let init_expr_ty = d.init_expr.as_ref().map(|e| type_of_expr(ty_env, e));
+                let ty = match (var_ty, init_expr_ty) {
+                    (Some(Type::Array(sty1, Some(len1))), Some(Type::Array(sty2, Some(len2)))) => {
+                        if sty1 != sty2 || len2 > len1 {
+                            panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", d.name.0);
+                        }
+                        Type::Array(sty1, Some(len1))
+                    }
+                    (Some(ty1), Some(ty2)) => {
+                        if ty1 != ty2 {
+                            panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", d.name.0);
+                        }
+                        ty1
+                    }
+                    (Some(ty), None) | (None, Some(ty)) => ty,
+                    (None, None) => panic!(
+                        "type error: a variable introduced by `let' must have an initialiser"
+                    ),
+                };
                 ty_env.insert(d.name.clone(), ty);
             }
             for stmt in body {
@@ -819,16 +830,26 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
             ty_env.enter();
             for d in declarations {
-                let ty = d
-                    .ty_annot
-                    .as_ref()
-                    .map(resolve_type_annot)
-                    .unwrap_or_else(|| match &d.init_expr {
-                        Some(e) => type_of_expr(ty_env, e),
-                        _ => panic!(
-                            "type error: a variable introduced by `let' must have an initialiser"
-                        ),
-                    });
+                let var_ty = d.ty_annot.as_ref().map(resolve_type_annot);
+                let init_expr_ty = d.init_expr.as_ref().map(|e| type_of_expr(ty_env, e));
+                let ty = match (var_ty, init_expr_ty) {
+                    (Some(Type::Array(sty1, Some(len1))), Some(Type::Array(sty2, Some(len2)))) => {
+                        if sty1 != sty2 || len2 > len1 {
+                            panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", d.name.0);
+                        }
+                        Type::Array(sty1, Some(len1))
+                    }
+                    (Some(ty1), Some(ty2)) => {
+                        if ty1 != ty2 {
+                            panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", d.name.0);
+                        }
+                        ty1
+                    }
+                    (Some(ty), None) | (None, Some(ty)) => ty,
+                    (None, None) => panic!(
+                        "type error: a variable introduced by `let' must have an initialiser"
+                    ),
+                };
                 ty_env.insert(d.name.clone(), ty);
             }
             for id in situations {
@@ -926,7 +947,7 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
                     panic!("type error: all the items in an array literal must have the same type");
                 }
             }
-            Type::Array(Box::new(ty))
+            Type::Array(Box::new(ty), Some(es.len()))
         }
         Expr::Ident(id) => ty_env
             .lookup(id)
@@ -939,7 +960,7 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
                 panic!("type error: array subscripts must have integer type");
             }
             match tty {
-                Type::Array(ty) => *ty,
+                Type::Array(ty, _) => *ty,
                 _ => panic!("type error: only arrays can be subscripted"),
             }
         }
