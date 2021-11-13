@@ -870,9 +870,18 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         Stmt::Assign(lhs, rhs) => {
             let lty = type_of_expr(ty_env, lhs);
             let rty = type_of_expr(ty_env, rhs);
-            if rty != lty {
-                panic!("type error: trying to assign {:?} to {:?}", rty, lty);
-            }
+            match (&lty, &rty) {
+                (Type::Array(sty1, Some(len1)), Type::Array(sty2, Some(len2))) => {
+                    if sty1 != sty2 || len2 > len1 {
+                        panic!("type error: trying to assign {:?} to {:?}", rty, lty);
+                    }
+                }
+                (ty1, ty2) => {
+                    if ty1 != ty2 {
+                        panic!("type error: trying to assign {:?} to {:?}", rty, lty);
+                    }
+                }
+            };
         }
         Stmt::IfThenElse(test, s, t) | Stmt::LoopWhile(s, test, t) => {
             let tty = type_of_expr(ty_env, test);
@@ -1255,6 +1264,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
             let item = compile_expr(e, gen, symtab);
             load(gen, item);
         }
+        // TODO: array assignment
         Stmt::Assign(lhs, rhs) => match compile_expr(lhs, gen, symtab) {
             Item::Imm(_) | Item::Stack => panic!("trying to assign to value on stack! bug?"),
             Item::Local(idx) => {
