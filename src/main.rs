@@ -48,6 +48,7 @@ struct VarDecl {
 enum Expr {
     BoolLit(bool),
     IntLit(i64),
+    ArrayLit(Vec<Expr>),
     Ident(Ident),
     Subscript(Box<Expr>, Box<Expr>),
     UnOp(UnOp, Box<Expr>),
@@ -701,6 +702,15 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::RPar);
                 expr
             }
+            TokenKind::LBrack => {
+                let mut es = vec![self.expr()];
+                while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Comma) {
+                    self.tokens.next();
+                    es.push(self.expr());
+                }
+                self.expect(TokenKind::RBrack);
+                Expr::ArrayLit(es)
+            }
             tok => panic!("syntactic error: expecting factor (context={:?})", tok),
         }
     }
@@ -785,6 +795,7 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         Stmt::Expr(e) => {
             type_of_expr(ty_env, e);
         }
+        // TODO: check initialiser types match the variable types
         Stmt::Block(declarations, body) => {
             ty_env.enter();
             for d in declarations {
@@ -902,8 +913,21 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
 
 fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
     match expr {
-        &Expr::BoolLit(_) => Type::Boolean,
+        Expr::BoolLit(_) => Type::Boolean,
         Expr::IntLit(_) => Type::Integer,
+        Expr::ArrayLit(es) => {
+            if es.is_empty() {
+                panic!("type error: can't determine the base type of an empty array literal");
+            }
+            let mut etys = es.iter().map(|e| type_of_expr(ty_env, e));
+            let ty = etys.next().unwrap();
+            for ety in etys {
+                if ety != ty {
+                    panic!("type error: all the items in an array literal must have the same type");
+                }
+            }
+            Type::Array(Box::new(ty))
+        }
         Expr::Ident(id) => ty_env
             .lookup(id)
             .cloned()
@@ -1238,10 +1262,22 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
                         idx
                     } // TODO: not correct
                 };
-                if let Some(e) = &d.init_expr {
-                    let item = compile_expr(e, gen, symtab);
-                    load(gen, item);
-                    gen.emit(OpCode::StLoc(idx));
+                match &d.init_expr {
+                    Some(Expr::ArrayLit(es)) => {
+                        for (i, e) in es.iter().enumerate() {
+                            gen.emit(OpCode::LdcI8(idx.0 as i64));
+                            gen.emit(OpCode::LdcI8(i as i64));
+                            let item = compile_expr(e, gen, symtab);
+                            load(gen, item);
+                            gen.emit(OpCode::StElem)
+                        }
+                    }
+                    Some(e) => {
+                        let item = compile_expr(e, gen, symtab);
+                        load(gen, item);
+                        gen.emit(OpCode::StLoc(idx));
+                    }
+                    _ => (),
                 }
             }
             for s in body {
@@ -1401,6 +1437,7 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
     match expr {
         Expr::BoolLit(b) => Item::Imm(if *b { 1 } else { 0 }),
         Expr::IntLit(n) => Item::Imm(*n),
+        Expr::ArrayLit(_) => Item::Stack,
         Expr::Ident(id) => {
             let sym = symtab
                 .lookup(id)
@@ -1498,6 +1535,8 @@ fn load(gen: &mut CodeBlock, item: Item) {
         Item::Stack => (),
     }
 }
+
+// Driver
 
 fn compile_and_run(s: &str, args: &[i64]) {
     let sr = SourceReader::new(s);
