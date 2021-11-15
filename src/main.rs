@@ -64,6 +64,8 @@ enum UnOp {
 enum BinOp {
     Plus,
     Minus,
+    Mul,
+    Div,
     Eq,
     Neq,
     Lt,
@@ -80,6 +82,8 @@ enum TokenKind {
     Ident,
     Plus,
     Minus,
+    Star,
+    Slash,
     Eq,
     Neq,
     Lt,
@@ -176,6 +180,14 @@ impl<'a> Iterator for Tokens<'a> {
             Some('-') => {
                 token.text.push(self.reader.read().unwrap());
                 TokenKind::Minus
+            }
+            Some('*') => {
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Star
+            }
+            Some('/') => {
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Slash
             }
             Some('=') => {
                 token.text.push(self.reader.read().unwrap());
@@ -352,6 +364,12 @@ impl<'a> Parser<'a> {
         tok.kind == TokenKind::KwBoolean
             || tok.kind == TokenKind::Plus
             || tok.kind == TokenKind::Minus
+    }
+
+    fn is_mul_op(tok: &Token) -> bool {
+        tok.kind == TokenKind::KwBoolean
+            || tok.kind == TokenKind::Star
+            || tok.kind == TokenKind::Slash
     }
 
     fn is_rel_op(tok: &Token) -> bool {
@@ -677,7 +695,25 @@ impl<'a> Parser<'a> {
     }
 
     fn term(&mut self) -> Expr {
-        self.factor()
+        let mut lhs = self.factor();
+        while matches!(
+            self.tokens.peek(),
+            Some(tok) if Self::is_mul_op(tok)
+        ) {
+            let op = match self.tokens.next() {
+                Some(Token {
+                    kind: TokenKind::Star,
+                    ..
+                }) => BinOp::Mul,
+                Some(Token {
+                    kind: TokenKind::Slash,
+                    ..
+                }) => BinOp::Div,
+                _ => panic!(),
+            };
+            lhs = Expr::BinOp(op, Box::new(lhs), Box::new(self.factor()));
+        }
+        lhs
     }
 
     fn factor(&mut self) -> Expr {
@@ -988,7 +1024,7 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
             let lty = type_of_expr(ty_env, lhs);
             let rty = type_of_expr(ty_env, rhs);
             match op {
-                BinOp::Plus | BinOp::Minus => {
+                BinOp::Plus | BinOp::Minus | BinOp::Mul | BinOp::Div => {
                     if lty != rty || lty != Type::Integer {
                         panic!("type error: operator {:?} must have integer operands", op);
                     }
@@ -1029,6 +1065,8 @@ enum OpCode {
     Not,
     Add,
     Sub,
+    Mul,
+    Div,
     Eq,
     Lt,
     Gt,
@@ -1048,6 +1086,8 @@ impl Display for OpCode {
             OpCode::Not => f.write_str("not"),
             OpCode::Add => f.write_str("add"),
             OpCode::Sub => f.write_str("sub"),
+            OpCode::Mul => f.write_str("mul"),
+            OpCode::Div => f.write_str("div"),
             OpCode::Eq => f.write_str("eq"),
             OpCode::Lt => f.write_str("lt"),
             OpCode::Gt => f.write_str("gt"),
@@ -1191,6 +1231,18 @@ impl Vm {
                     let n = self.stack.pop().expect("stack underflow");
                     let m = self.stack.pop().expect("stack underflow");
                     self.stack.push(m - n);
+                    ip += 1;
+                }
+                OpCode::Mul => {
+                    let n = self.stack.pop().expect("stack underflow");
+                    let m = self.stack.pop().expect("stack underflow");
+                    self.stack.push(m * n);
+                    ip += 1;
+                }
+                OpCode::Div => {
+                    let n = self.stack.pop().expect("stack underflow");
+                    let m = self.stack.pop().expect("stack underflow");
+                    self.stack.push(m / n);
                     ip += 1;
                 }
                 OpCode::Eq => {
@@ -1517,9 +1569,12 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
             let litem = compile_expr(lhs, gen, symtab);
             let ritem = compile_expr(rhs, gen, symtab);
             match (litem, ritem) {
+                // TODO: overflow
                 (Item::Imm(m), Item::Imm(n)) => match op {
                     BinOp::Plus => Item::Imm(m + n),
                     BinOp::Minus => Item::Imm(m - n),
+                    BinOp::Mul => Item::Imm(m * n),
+                    BinOp::Div => Item::Imm(m / n),
                     BinOp::Eq => Item::Imm(if m == n { 1 } else { 0 }),
                     BinOp::Neq => Item::Imm(if m != n { 1 } else { 0 }),
                     BinOp::Lt => Item::Imm(if m < n { 1 } else { 0 }),
@@ -1533,6 +1588,8 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
                     match op {
                         BinOp::Plus => gen.emit(OpCode::Add),
                         BinOp::Minus => gen.emit(OpCode::Sub),
+                        BinOp::Mul => gen.emit(OpCode::Mul),
+                        BinOp::Div => gen.emit(OpCode::Div),
                         BinOp::Eq => gen.emit(OpCode::Eq),
                         BinOp::Neq => {
                             gen.emit(OpCode::Eq);
@@ -1574,6 +1631,7 @@ fn compile_and_run(s: &str, args: &[i64]) {
     let mut s = Scanner::new(sr);
     let mut p = Parser::new(s.scan());
     let node = p.parse();
+    println!("; {:?}", node);
 
     let mut ty_env = TypeEnv::new();
     type_check(&mut ty_env, &node);

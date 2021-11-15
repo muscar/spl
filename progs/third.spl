@@ -1,7 +1,5 @@
 begin
-  integer target := ARGS[0];
-  integer n := ARGS[1];
-  integer i := 2;
+  integer target := ARGS[0], n := ARGS[1], i := 2;
   boolean success := false;
 
   loop until found or done
