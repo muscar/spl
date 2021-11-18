@@ -28,20 +28,19 @@ struct Program {
 enum Stmt {
     Skip,
     Expr(Box<Expr>),
-    Block(Vec<VarDecl>, Vec<Stmt>),
+    Block(Vec<Decl>, Vec<Stmt>),
     Assign(Box<Expr>, Box<Expr>),
     IfThenElse(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
-    BeginUntil(Vec<VarDecl>, Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
+    BeginUntil(Vec<Decl>, Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
     LoopWhile(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
     LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
     WhileElseIf(Box<Expr>, Vec<Stmt>, Vec<(Expr, Vec<Stmt>)>),
 }
 
 #[derive(Debug)]
-struct VarDecl {
-    name: Ident,
-    ty_annot: Option<TypeAnnot>,
-    init_expr: Option<Expr>,
+enum Decl {
+    Var(Ident, Option<TypeAnnot>, Option<Expr>),
+    Procedure(Ident, Option<TypeAnnot>, Vec<(Ident, TypeAnnot)>),
 }
 
 #[derive(Debug)]
@@ -101,11 +100,15 @@ enum TokenKind {
     RPar,
     LBrack,
     RBrack,
+    KwTrue,
+    KwFalse,
     KwBoolean,
     KwInteger,
     KwString,
+    KwOr,
     KwArray,
     KwLet,
+    KwProcedure,
     KwBegin,
     KwEnd,
     KwIf,
@@ -117,9 +120,6 @@ enum TokenKind {
     KwRepeat,
     KwUntil,
     KwSkip,
-    KwOr,
-    KwTrue,
-    KwFalse,
     Unknown,
     Eof,
 }
@@ -324,11 +324,12 @@ impl<'a> Scanner<'a> {
 
     fn scan(&'a mut self) -> Tokens<'a> {
         let mut keywords = HashMap::new();
-        keywords.insert("array", TokenKind::KwArray);
         keywords.insert("boolean", TokenKind::KwBoolean);
         keywords.insert("integer", TokenKind::KwInteger);
         keywords.insert("string", TokenKind::KwString);
         keywords.insert("let", TokenKind::KwLet);
+        keywords.insert("array", TokenKind::KwArray);
+        keywords.insert("procedure", TokenKind::KwProcedure);
         keywords.insert("begin", TokenKind::KwBegin);
         keywords.insert("end", TokenKind::KwEnd);
         keywords.insert("if", TokenKind::KwIf);
@@ -496,7 +497,7 @@ impl<'a> Parser<'a> {
         Stmt::BeginUntil(declarations, situations, s, handlers)
     }
 
-    fn var_decls(&mut self) -> Vec<VarDecl> {
+    fn var_decls(&mut self) -> Vec<Decl> {
         let mut decls = Vec::new();
         while matches!(
             self.tokens.peek(),
@@ -526,11 +527,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            decls.push(VarDecl {
-                name,
-                ty_annot: ty_annot.clone(),
-                init_expr,
-            });
+            decls.push(Decl::Var(name, ty_annot.clone(), init_expr));
             while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Comma) {
                 self.tokens.next();
                 let name = self.ident();
@@ -541,11 +538,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                decls.push(VarDecl {
-                    name,
-                    ty_annot: ty_annot.clone(),
-                    init_expr,
-                });
+                decls.push(Decl::Var(name, ty_annot.clone(), init_expr));
             }
 
             self.expect(TokenKind::Semicolon);
@@ -827,6 +820,35 @@ fn type_check(ty_env: &mut TypeEnv, prog: &Program) {
     ty_env.exit();
 }
 
+fn type_check_decl(ty_env: &mut TypeEnv, decl: &Decl) {
+    match decl {
+        Decl::Var(name, ty_annot, init_expr) => {
+            let var_ty = ty_annot.as_ref().map(resolve_type_annot);
+            let init_expr_ty = init_expr.as_ref().map(|e| type_of_expr(ty_env, e));
+            let ty = match (var_ty, init_expr_ty) {
+                (Some(Type::Array(sty1, Some(len1))), Some(Type::Array(sty2, Some(len2)))) => {
+                    if sty1 != sty2 || len2 > len1 {
+                        panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", name.0);
+                    }
+                    Type::Array(sty1, Some(len1))
+                }
+                (Some(ty1), Some(ty2)) => {
+                    if ty1 != ty2 {
+                        panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", name.0);
+                    }
+                    ty1
+                }
+                (Some(ty), None) | (None, Some(ty)) => ty,
+                (None, None) => {
+                    panic!("type error: a variable introduced by `let' must have an initialiser")
+                }
+            };
+            ty_env.insert(name.clone(), ty);
+        }
+        Decl::Procedure(_, _, _) => todo!(),
+    }
+}
+
 fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
     match stmt {
         Stmt::Skip => (),
@@ -836,27 +858,7 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         Stmt::Block(declarations, body) => {
             ty_env.enter();
             for d in declarations {
-                let var_ty = d.ty_annot.as_ref().map(resolve_type_annot);
-                let init_expr_ty = d.init_expr.as_ref().map(|e| type_of_expr(ty_env, e));
-                let ty = match (var_ty, init_expr_ty) {
-                    (Some(Type::Array(sty1, Some(len1))), Some(Type::Array(sty2, Some(len2)))) => {
-                        if sty1 != sty2 || len2 > len1 {
-                            panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", d.name.0);
-                        }
-                        Type::Array(sty1, Some(len1))
-                    }
-                    (Some(ty1), Some(ty2)) => {
-                        if ty1 != ty2 {
-                            panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", d.name.0);
-                        }
-                        ty1
-                    }
-                    (Some(ty), None) | (None, Some(ty)) => ty,
-                    (None, None) => panic!(
-                        "type error: a variable introduced by `let' must have an initialiser"
-                    ),
-                };
-                ty_env.insert(d.name.clone(), ty);
+                type_check_decl(ty_env, d);
             }
             for stmt in body {
                 type_check_stmt(ty_env, stmt);
@@ -866,27 +868,7 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
             ty_env.enter();
             for d in declarations {
-                let var_ty = d.ty_annot.as_ref().map(resolve_type_annot);
-                let init_expr_ty = d.init_expr.as_ref().map(|e| type_of_expr(ty_env, e));
-                let ty = match (var_ty, init_expr_ty) {
-                    (Some(Type::Array(sty1, Some(len1))), Some(Type::Array(sty2, Some(len2)))) => {
-                        if sty1 != sty2 || len2 > len1 {
-                            panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", d.name.0);
-                        }
-                        Type::Array(sty1, Some(len1))
-                    }
-                    (Some(ty1), Some(ty2)) => {
-                        if ty1 != ty2 {
-                            panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", d.name.0);
-                        }
-                        ty1
-                    }
-                    (Some(ty), None) | (None, Some(ty)) => ty,
-                    (None, None) => panic!(
-                        "type error: a variable introduced by `let' must have an initialiser"
-                    ),
-                };
-                ty_env.insert(d.name.clone(), ty);
+                type_check_decl(ty_env, d);
             }
             for id in situations {
                 ty_env.insert(id.clone(), Type::Integer);
@@ -1309,6 +1291,43 @@ fn compile(prog: &Program, gen: &mut CodeBlock) {
     symtab.exit();
 }
 
+fn compile_decl(decl: &Decl, gen: &mut CodeBlock, symtab: &mut SymTab) {
+    match decl {
+        Decl::Var(name, ty_annot, init_expr) => {
+            let idx = match ty_annot {
+                Some(TypeAnnot::Array(_, dim)) => {
+                    let idx = gen.add_local(*dim);
+                    symtab.insert(name.clone(), Symbol::LocalArray(idx, *dim));
+                    idx
+                }
+                _ => {
+                    let idx = gen.add_local(1);
+                    symtab.insert(name.clone(), Symbol::Local(idx));
+                    idx
+                } // TODO: not correct
+            };
+            match &init_expr {
+                Some(Expr::ArrayLit(es)) => {
+                    for (i, e) in es.iter().enumerate() {
+                        gen.emit(OpCode::LdcI8(idx.0 as i64));
+                        gen.emit(OpCode::LdcI8(i as i64));
+                        let item = compile_expr(e, gen, symtab);
+                        load(gen, item);
+                        gen.emit(OpCode::StElem)
+                    }
+                }
+                Some(e) => {
+                    let item = compile_expr(e, gen, symtab);
+                    load(gen, item);
+                    gen.emit(OpCode::StLoc(idx));
+                }
+                _ => (),
+            }
+        }
+        Decl::Procedure(_, _, _) => todo!(),
+    }
+}
+
 fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
     match stmt {
         Stmt::Skip => gen.emit(OpCode::Nop),
@@ -1333,35 +1352,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
         Stmt::Block(declarations, body) => {
             symtab.enter();
             for d in declarations {
-                let idx = match d.ty_annot {
-                    Some(TypeAnnot::Array(_, dim)) => {
-                        let idx = gen.add_local(dim);
-                        symtab.insert(d.name.clone(), Symbol::LocalArray(idx, dim));
-                        idx
-                    }
-                    _ => {
-                        let idx = gen.add_local(1);
-                        symtab.insert(d.name.clone(), Symbol::Local(idx));
-                        idx
-                    } // TODO: not correct
-                };
-                match &d.init_expr {
-                    Some(Expr::ArrayLit(es)) => {
-                        for (i, e) in es.iter().enumerate() {
-                            gen.emit(OpCode::LdcI8(idx.0 as i64));
-                            gen.emit(OpCode::LdcI8(i as i64));
-                            let item = compile_expr(e, gen, symtab);
-                            load(gen, item);
-                            gen.emit(OpCode::StElem)
-                        }
-                    }
-                    Some(e) => {
-                        let item = compile_expr(e, gen, symtab);
-                        load(gen, item);
-                        gen.emit(OpCode::StLoc(idx));
-                    }
-                    _ => (),
-                }
+                compile_decl(d, gen, symtab);
             }
             for s in body {
                 compile_stmt(s, gen, symtab);
@@ -1371,23 +1362,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
         Stmt::BeginUntil(declarations, situations, s, handlers) => {
             symtab.enter();
             for d in declarations {
-                let idx = match d.ty_annot {
-                    Some(TypeAnnot::Array(_, dim)) => {
-                        let idx = gen.add_local(dim);
-                        symtab.insert(d.name.clone(), Symbol::LocalArray(idx, dim));
-                        idx
-                    }
-                    _ => {
-                        let idx = gen.add_local(1);
-                        symtab.insert(d.name.clone(), Symbol::Local(idx));
-                        idx
-                    } // TODO: not correct
-                };
-                if let Some(e) = &d.init_expr {
-                    let item = compile_expr(e, gen, symtab);
-                    load(gen, item);
-                    gen.emit(OpCode::StLoc(idx));
-                }
+                compile_decl(d, gen, symtab);
             }
             let end_lab = gen.new_label();
             let mut situation_labs = HashMap::new();
