@@ -11,5 +11,6 @@ begin
     found => success := true
     done => skip
   fi;
-  success
+  let result := success;
+  result
 end.

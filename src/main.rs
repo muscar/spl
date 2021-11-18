@@ -28,10 +28,11 @@ struct Program {
 enum Stmt {
     Skip,
     Expr(Box<Expr>),
-    Block(Vec<Decl>, Vec<Stmt>),
+    Block(Vec<Stmt>),
     Assign(Box<Expr>, Box<Expr>),
+    Decls(Vec<Decl>),
     IfThenElse(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
-    BeginUntil(Vec<Decl>, Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
+    BeginUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
     LoopWhile(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
     LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
     WhileElseIf(Box<Expr>, Vec<Stmt>, Vec<(Expr, Vec<Stmt>)>),
@@ -453,6 +454,9 @@ impl<'a> Parser<'a> {
                 self.tokens.next();
                 Stmt::Skip
             }
+            Some(tok) if Self::is_builtin_type_name(tok) || tok.kind == TokenKind::KwLet => {
+                self.var_decls()
+            }
             Some(tok) if tok.kind == TokenKind::KwBegin => self.block_dispatch(),
             Some(tok) if tok.kind == TokenKind::KwIf => self.if_then_else(),
             Some(tok) if tok.kind == TokenKind::KwLoop => self.loop_dispatch(),
@@ -476,16 +480,14 @@ impl<'a> Parser<'a> {
     }
 
     fn begin(&mut self) -> Stmt {
-        let declarations = self.var_decls();
         let body = self.statement_list();
         self.expect(TokenKind::KwEnd);
-        Stmt::Block(declarations, body)
+        Stmt::Block(body)
     }
 
     fn begin_until(&mut self) -> Stmt {
         self.expect(TokenKind::KwUntil);
         let situations = self.ident_list(TokenKind::KwOr);
-        let declarations = self.var_decls();
         let s = self.statement_list();
         self.expect(TokenKind::KwEnd);
         self.expect(TokenKind::KwThen);
@@ -494,32 +496,39 @@ impl<'a> Parser<'a> {
             handlers.push(self.situation_handler());
         }
         self.expect(TokenKind::KwFi);
-        Stmt::BeginUntil(declarations, situations, s, handlers)
+        Stmt::BeginUntil(situations, s, handlers)
     }
 
-    fn var_decls(&mut self) -> Vec<Decl> {
+    fn var_decls(&mut self) -> Stmt {
         let mut decls = Vec::new();
-        while matches!(
-            self.tokens.peek(),
-            Some(tok) if Self::is_builtin_type_name(tok) || tok.kind == TokenKind::KwLet
-        ) {
-            let mut ty_annot = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwLet)
-            {
-                self.tokens.next();
-                None
-            } else {
-                Some(self.type_annot())
-            };
+        let mut ty_annot = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwLet)
+        {
+            self.tokens.next();
+            None
+        } else {
+            Some(self.type_annot())
+        };
+        let name = self.ident();
+        if let Some(TypeAnnot::Array(base_type, _)) = ty_annot {
+            self.expect(TokenKind::LBrack);
+            let dim = self
+                .expect(TokenKind::IntLit)
+                .parse()
+                .expect("array dimensions must be integer literals");
+            ty_annot = Some(TypeAnnot::Array(base_type, dim));
+            self.expect(TokenKind::RBrack);
+        }
+        let init_expr = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes)
+        {
+            self.tokens.next();
+            Some(self.expr())
+        } else {
+            None
+        };
+        decls.push(Decl::Var(name, ty_annot.clone(), init_expr));
+        while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Comma) {
+            self.tokens.next();
             let name = self.ident();
-            if let Some(TypeAnnot::Array(base_type, _)) = ty_annot {
-                self.expect(TokenKind::LBrack);
-                let dim = self
-                    .expect(TokenKind::IntLit)
-                    .parse()
-                    .expect("array dimensions must be integer literals");
-                ty_annot = Some(TypeAnnot::Array(base_type, dim));
-                self.expect(TokenKind::RBrack);
-            }
             let init_expr = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes)
             {
                 self.tokens.next();
@@ -528,22 +537,8 @@ impl<'a> Parser<'a> {
                 None
             };
             decls.push(Decl::Var(name, ty_annot.clone(), init_expr));
-            while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Comma) {
-                self.tokens.next();
-                let name = self.ident();
-                let init_expr = if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes)
-                {
-                    self.tokens.next();
-                    Some(self.expr())
-                } else {
-                    None
-                };
-                decls.push(Decl::Var(name, ty_annot.clone(), init_expr));
-            }
-
-            self.expect(TokenKind::Semicolon);
         }
-        decls
+        Stmt::Decls(decls)
     }
 
     fn loop_dispatch(&mut self) -> Stmt {
@@ -855,21 +850,20 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         Stmt::Expr(e) => {
             type_of_expr(ty_env, e);
         }
-        Stmt::Block(declarations, body) => {
-            ty_env.enter();
-            for d in declarations {
+        Stmt::Decls(decls) => {
+            for d in decls {
                 type_check_decl(ty_env, d);
             }
+        }
+        Stmt::Block(body) => {
+            ty_env.enter();
             for stmt in body {
                 type_check_stmt(ty_env, stmt);
             }
             ty_env.exit();
         }
-        Stmt::BeginUntil(declarations, situations, s, handlers) => {
+        Stmt::BeginUntil(situations, s, handlers) => {
             ty_env.enter();
-            for d in declarations {
-                type_check_decl(ty_env, d);
-            }
             for id in situations {
                 ty_env.insert(id.clone(), Type::Integer);
             }
@@ -1349,21 +1343,20 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
                 gen.emit(OpCode::StElem);
             }
         },
-        Stmt::Block(declarations, body) => {
-            symtab.enter();
-            for d in declarations {
+        Stmt::Decls(decls) => {
+            for d in decls {
                 compile_decl(d, gen, symtab);
             }
+        }
+        Stmt::Block(body) => {
+            symtab.enter();
             for s in body {
                 compile_stmt(s, gen, symtab);
             }
             symtab.exit();
         }
-        Stmt::BeginUntil(declarations, situations, s, handlers) => {
+        Stmt::BeginUntil(situations, s, handlers) => {
             symtab.enter();
-            for d in declarations {
-                compile_decl(d, gen, symtab);
-            }
             let end_lab = gen.new_label();
             let mut situation_labs = HashMap::new();
             for id in situations {
