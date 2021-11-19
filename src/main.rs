@@ -78,6 +78,8 @@ enum BinOp {
     Lte,
     Gt,
     Gte,
+    LogicAnd,
+    LogicOr,
 }
 
 // Scanner
@@ -96,6 +98,7 @@ enum TokenKind {
     Lte,
     Gt,
     Gte,
+    Ampersand,
     Tilde,
     Becomes,
     FatArrow,
@@ -113,6 +116,7 @@ enum TokenKind {
     KwInteger,
     KwString,
     KwOr,
+    KwAnd,
     KwArray,
     KwLet,
     KwProcedure,
@@ -194,7 +198,12 @@ impl<'a> Iterator for Tokens<'a> {
             }
             Some('/') => {
                 token.text.push(self.reader.read().unwrap());
-                TokenKind::Slash
+                if self.reader.peek() == Some('=') {
+                    token.text.push(self.reader.read().unwrap());
+                    TokenKind::Neq
+                } else {
+                    TokenKind::Slash
+                }
             }
             Some('=') => {
                 token.text.push(self.reader.read().unwrap());
@@ -205,7 +214,7 @@ impl<'a> Iterator for Tokens<'a> {
                     TokenKind::Eq
                 }
             }
-            Some('≠') => {
+            Some('≠') | Some('#') => {
                 token.text.push(self.reader.read().unwrap());
                 TokenKind::Neq
             }
@@ -243,6 +252,10 @@ impl<'a> Iterator for Tokens<'a> {
             Some('≥') => {
                 token.text.push(self.reader.read().unwrap());
                 TokenKind::Gte
+            }
+            Some('&') => {
+                token.text.push(self.reader.read().unwrap());
+                TokenKind::Ampersand
             }
             Some('~') => {
                 token.text.push(self.reader.read().unwrap());
@@ -348,6 +361,7 @@ impl<'a> Scanner<'a> {
         keywords.insert("repeat", TokenKind::KwRepeat);
         keywords.insert("until", TokenKind::KwUntil);
         keywords.insert("skip", TokenKind::KwSkip);
+        keywords.insert("and", TokenKind::KwAnd);
         keywords.insert("or", TokenKind::KwOr);
         keywords.insert("true", TokenKind::KwTrue);
         keywords.insert("false", TokenKind::KwFalse);
@@ -372,12 +386,15 @@ impl<'a> Parser<'a> {
         tok.kind == TokenKind::KwBoolean
             || tok.kind == TokenKind::Plus
             || tok.kind == TokenKind::Minus
+            || tok.kind == TokenKind::KwOr
     }
 
     fn is_mul_op(tok: &Token) -> bool {
         tok.kind == TokenKind::KwBoolean
             || tok.kind == TokenKind::Star
             || tok.kind == TokenKind::Slash
+            || tok.kind == TokenKind::KwAnd
+            || tok.kind == TokenKind::Ampersand
     }
 
     fn is_rel_op(tok: &Token) -> bool {
@@ -689,6 +706,10 @@ impl<'a> Parser<'a> {
                     kind: TokenKind::Minus,
                     ..
                 }) => BinOp::Minus,
+                Some(Token {
+                    kind: TokenKind::KwOr,
+                    ..
+                }) => BinOp::LogicOr,
                 _ => panic!(),
             };
             lhs = Expr::BinOp(op, Box::new(lhs), Box::new(self.term()));
@@ -711,6 +732,14 @@ impl<'a> Parser<'a> {
                     kind: TokenKind::Slash,
                     ..
                 }) => BinOp::Div,
+                Some(Token {
+                    kind: TokenKind::KwAnd,
+                    ..
+                }) => BinOp::LogicAnd,
+                Some(Token {
+                    kind: TokenKind::Ampersand,
+                    ..
+                }) => BinOp::LogicAnd,
                 _ => panic!(),
             };
             lhs = Expr::BinOp(op, Box::new(lhs), Box::new(self.factor()));
@@ -1017,6 +1046,12 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
                 BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
                     if lty != rty || lty != Type::Integer {
                         panic!("type error: operator {:?} must have integer operands", op);
+                    }
+                    Type::Boolean
+                }
+                BinOp::LogicAnd | BinOp::LogicOr => {
+                    if lty != rty || lty != Type::Boolean {
+                        panic!("type error: operator {:?} must have boolean operands", op);
                     }
                     Type::Boolean
                 }
@@ -1519,6 +1554,42 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
                 }
             }
         }
+        Expr::BinOp(BinOp::LogicAnd, lhs, rhs) => {
+            let false_lab = gen.new_label();
+            let end_lab = gen.new_label();
+            let litem = compile_expr(lhs, gen, symtab);
+            load(gen, litem);
+            gen.emit(OpCode::BrFalse(false_lab));
+            let ritem = compile_expr(rhs, gen, symtab);
+            load(gen, ritem);
+            gen.emit(OpCode::BrFalse(false_lab));
+            gen.emit(OpCode::LdcI8(1));
+            gen.emit(OpCode::Br(end_lab));
+            gen.mark_label(false_lab);
+            gen.emit(OpCode::LdcI8(0));
+            gen.mark_label(end_lab);
+            Item::Stack
+        }
+        Expr::BinOp(BinOp::LogicOr, lhs, rhs) => {
+            let else_lab = gen.new_label();
+            let false_lab = gen.new_label();
+            let end_lab = gen.new_label();
+            let litem = compile_expr(lhs, gen, symtab);
+            load(gen, litem);
+            gen.emit(OpCode::BrFalse(else_lab));
+            gen.emit(OpCode::LdcI8(1));
+            gen.emit(OpCode::Br(end_lab));
+            gen.mark_label(else_lab);
+            let ritem = compile_expr(rhs, gen, symtab);
+            load(gen, ritem);
+            gen.emit(OpCode::BrFalse(false_lab));
+            gen.emit(OpCode::LdcI8(1));
+            gen.emit(OpCode::Br(end_lab));
+            gen.mark_label(false_lab);
+            gen.emit(OpCode::LdcI8(0));
+            gen.mark_label(end_lab);
+            Item::Stack
+        }
         Expr::BinOp(op, lhs, rhs) => {
             let litem = compile_expr(lhs, gen, symtab);
             let ritem = compile_expr(rhs, gen, symtab);
@@ -1535,6 +1606,7 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
                     BinOp::Lte => Item::Imm(if m <= n { 1 } else { 0 }),
                     BinOp::Gt => Item::Imm(if m > n { 1 } else { 0 }),
                     BinOp::Gte => Item::Imm(if m >= n { 1 } else { 0 }),
+                    _ => panic!(),
                 },
                 _ => {
                     load(gen, litem);
@@ -1559,6 +1631,7 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
                             gen.emit(OpCode::Lt);
                             gen.emit(OpCode::Not);
                         }
+                        _ => panic!(),
                     }
                     Item::Stack
                 }

@@ -1,0 +1,4 @@
+begin integer target := ARGS[0], n := ARGS[1], i := 2;
+  while (i ≤ n) and (ARGS[i] ≠ target) i := i + 1; fi;
+  i ≤ n
+end.
