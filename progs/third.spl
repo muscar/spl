@@ -3,14 +3,14 @@ begin
   boolean success := false;
 
   loop until found or done
-    if ARGS[i] = target then found
-    else if i <= n then i := i + 1 else done fi
-    fi
+    if ARGS[i] = target then found;
+    else if i <= n then i := i + 1; else done; fi;
+    fi;
   repeat
   then
     found => success := true
     done => skip
   fi;
   let result := success;
-  result
+  result;
 end.

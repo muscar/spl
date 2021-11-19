@@ -25,23 +25,29 @@ struct Program {
 }
 
 #[derive(Debug)]
-enum Stmt {
-    Skip,
-    Expr(Box<Expr>),
-    Block(Vec<Stmt>),
-    Assign(Box<Expr>, Box<Expr>),
-    Decls(Vec<Decl>),
-    IfThenElse(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
-    BeginUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
-    LoopWhile(Vec<Stmt>, Box<Expr>, Vec<Stmt>),
-    LoopUntil(Vec<Ident>, Vec<Stmt>, Vec<(Ident, Stmt)>),
-    WhileElseIf(Box<Expr>, Vec<Stmt>, Vec<(Expr, Vec<Stmt>)>),
-}
-
-#[derive(Debug)]
 enum Decl {
     Var(Ident, Option<TypeAnnot>, Option<Expr>),
     Procedure(Ident, Option<TypeAnnot>, Vec<(Ident, TypeAnnot)>),
+}
+
+#[derive(Debug)]
+struct Block {
+    body: Vec<Stmt>,
+    discard_value: bool,
+}
+
+#[derive(Debug)]
+enum Stmt {
+    Skip,
+    Expr(Expr),
+    Block(Block),
+    Assign(Expr, Expr),
+    Decls(Vec<Decl>),
+    IfThenElse(Expr, Box<Stmt>, Box<Stmt>),
+    BeginUntil(Vec<Ident>, Box<Stmt>, Vec<(Ident, Stmt)>),
+    LoopWhile(Box<Stmt>, Expr, Box<Stmt>),
+    LoopUntil(Vec<Ident>, Box<Stmt>, Vec<(Ident, Stmt)>),
+    WhileElseIf(Expr, Box<Stmt>, Vec<(Expr, Stmt)>),
 }
 
 #[derive(Debug)]
@@ -439,13 +445,24 @@ impl<'a> Parser<'a> {
         Program { body }
     }
 
-    fn statement_list(&mut self) -> Vec<Stmt> {
-        let mut body = vec![self.statement()];
-        while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Semicolon) {
-            self.tokens.next();
+    fn statement_list(&mut self, end_toks: Vec<TokenKind>) -> Stmt {
+        let mut body = vec![];
+        let mut discard_value = true;
+        // TODO: contains() is slow
+        while matches!(self.tokens.peek(), Some(tok) if !end_toks.contains(&tok.kind)) {
             body.push(self.statement());
+            if !matches!(self.tokens.peek
+                (), Some(tok) if tok.kind == TokenKind::Semicolon)
+            {
+                discard_value = false;
+                break;
+            }
+            self.tokens.next();
         }
-        body
+        Stmt::Block(Block {
+            body,
+            discard_value,
+        })
     }
 
     fn statement(&mut self) -> Stmt {
@@ -466,7 +483,7 @@ impl<'a> Parser<'a> {
                 if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
                     return self.assignment(lhs);
                 }
-                Stmt::Expr(Box::new(lhs))
+                Stmt::Expr(lhs)
             }
         }
     }
@@ -480,15 +497,15 @@ impl<'a> Parser<'a> {
     }
 
     fn begin(&mut self) -> Stmt {
-        let body = self.statement_list();
+        let body = self.statement_list(vec![TokenKind::KwEnd]);
         self.expect(TokenKind::KwEnd);
-        Stmt::Block(body)
+        body
     }
 
     fn begin_until(&mut self) -> Stmt {
         self.expect(TokenKind::KwUntil);
         let situations = self.ident_list(TokenKind::KwOr);
-        let s = self.statement_list();
+        let s = self.statement_list(vec![TokenKind::KwEnd]);
         self.expect(TokenKind::KwEnd);
         self.expect(TokenKind::KwThen);
         let mut handlers = vec![self.situation_handler()];
@@ -496,7 +513,7 @@ impl<'a> Parser<'a> {
             handlers.push(self.situation_handler());
         }
         self.expect(TokenKind::KwFi);
-        Stmt::BeginUntil(situations, s, handlers)
+        Stmt::BeginUntil(situations, Box::new(s), handlers)
     }
 
     fn var_decls(&mut self) -> Stmt {
@@ -552,7 +569,7 @@ impl<'a> Parser<'a> {
     fn loop_until_repeat(&mut self) -> Stmt {
         self.expect(TokenKind::KwUntil);
         let situations = self.ident_list(TokenKind::KwOr);
-        let s = self.statement_list();
+        let s = self.statement_list(vec![TokenKind::KwRepeat]);
         self.expect(TokenKind::KwRepeat);
         self.expect(TokenKind::KwThen);
         let mut handlers = vec![self.situation_handler()];
@@ -560,7 +577,7 @@ impl<'a> Parser<'a> {
             handlers.push(self.situation_handler());
         }
         self.expect(TokenKind::KwFi);
-        Stmt::LoopUntil(situations, s, handlers)
+        Stmt::LoopUntil(situations, Box::new(s), handlers)
     }
 
     fn situation_handler(&mut self) -> (Ident, Stmt) {
@@ -571,55 +588,52 @@ impl<'a> Parser<'a> {
     }
 
     fn loop_while_repeat(&mut self) -> Stmt {
-        let mut s = Vec::new();
-        if !matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwWhile) {
-            s = self.statement_list();
-        }
+        let s = self.statement_list(vec![TokenKind::KwWhile]);
         self.expect(TokenKind::KwWhile);
         let test = self.expr();
-        let mut t = Vec::new();
-        if !matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwRepeat) {
-            t = self.statement_list();
-        }
+        let t = self.statement_list(vec![TokenKind::KwRepeat]);
         self.expect(TokenKind::KwRepeat);
-        Stmt::LoopWhile(s, Box::new(test), t)
+        Stmt::LoopWhile(Box::new(s), test, Box::new(t))
     }
 
     fn while_else_if(&mut self) -> Stmt {
         self.expect(TokenKind::KwWhile);
         let test = self.expr();
-        let s = self.statement_list();
+        let s = self.statement_list(vec![TokenKind::KwElse, TokenKind::KwFi]);
         let mut alts = Vec::new();
         while matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwElse) {
             self.expect(TokenKind::KwElse);
             self.expect(TokenKind::KwIf);
             let test = self.expr();
             self.expect(TokenKind::KwThen);
-            let t = self.statement_list();
+            let t = self.statement_list(vec![TokenKind::KwElse, TokenKind::KwFi]);
             alts.push((test, t));
         }
         self.expect(TokenKind::KwFi);
-        Stmt::WhileElseIf(Box::new(test), s, alts)
+        Stmt::WhileElseIf(test, Box::new(s), alts)
     }
 
     fn if_then_else(&mut self) -> Stmt {
         self.expect(TokenKind::KwIf);
         let test = self.expr();
         self.expect(TokenKind::KwThen);
-        let cons = self.statement_list();
-        let mut alt = Vec::new();
+        let cons = self.statement_list(vec![TokenKind::KwElse, TokenKind::KwFi]);
+        let mut alt = Stmt::Block(Block {
+            body: vec![],
+            discard_value: false,
+        });
         if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::KwElse) {
             self.tokens.next();
-            alt = self.statement_list();
+            alt = self.statement_list(vec![TokenKind::KwFi]);
         }
         self.expect(TokenKind::KwFi);
-        Stmt::IfThenElse(Box::new(test), cons, alt)
+        Stmt::IfThenElse(test, Box::new(cons), Box::new(alt))
     }
 
     fn assignment(&mut self, lhs: Expr) -> Stmt {
         self.expect(TokenKind::Becomes);
         let rhs = self.expr();
-        Stmt::Assign(Box::new(lhs), Box::new(rhs))
+        Stmt::Assign(lhs, rhs)
     }
 
     fn expr(&mut self) -> Expr {
@@ -857,7 +871,7 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
         }
         Stmt::Block(body) => {
             ty_env.enter();
-            for stmt in body {
+            for stmt in &body.body {
                 type_check_stmt(ty_env, stmt);
             }
             ty_env.exit();
@@ -867,9 +881,7 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
             for id in situations {
                 ty_env.insert(id.clone(), Type::Integer);
             }
-            for stmt in s {
-                type_check_stmt(ty_env, stmt);
-            }
+            type_check_stmt(ty_env, s);
             for (id, s) in handlers {
                 // TODO: this is inefficient
                 if !situations.contains(id) {
@@ -901,14 +913,10 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
                 panic!("type error: condition must be a boolean value");
             }
             ty_env.enter();
-            for stmt in s {
-                type_check_stmt(ty_env, stmt);
-            }
+            type_check_stmt(ty_env, s);
             ty_env.exit();
             ty_env.enter();
-            for stmt in t {
-                type_check_stmt(ty_env, stmt);
-            }
+            type_check_stmt(ty_env, t);
             ty_env.exit();
         }
         Stmt::LoopUntil(situations, s, handlers) => {
@@ -917,9 +925,7 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
                 ty_env.insert(id.clone(), Type::Integer);
             }
             ty_env.enter();
-            for stmt in s {
-                type_check_stmt(ty_env, stmt);
-            }
+            type_check_stmt(ty_env, s);
             for (id, s) in handlers {
                 // TODO: this is inefficient
                 if !situations.contains(id) {
@@ -936,17 +942,13 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
                 panic!("type error: condition must be a boolean value");
             }
             ty_env.enter();
-            for stmt in s {
-                type_check_stmt(ty_env, stmt);
-            }
+            type_check_stmt(ty_env, s);
             for (atest, ablock) in alts {
                 let atty = type_of_expr(ty_env, atest);
                 if atty != Type::Boolean {
                     panic!("type error: condition must be a boolean value");
                 }
-                for stmt in ablock {
-                    type_check_stmt(ty_env, stmt);
-                }
+                type_check_stmt(ty_env, ablock);
             }
             ty_env.exit();
         }
@@ -1350,7 +1352,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
         }
         Stmt::Block(body) => {
             symtab.enter();
-            for s in body {
+            for s in &body.body {
                 compile_stmt(s, gen, symtab);
             }
             symtab.exit();
@@ -1364,9 +1366,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
                 symtab.insert(id.clone(), Symbol::Situation(lab));
                 situation_labs.insert(id.clone(), lab);
             }
-            for stmt in s {
-                compile_stmt(stmt, gen, symtab);
-            }
+            compile_stmt(s, gen, symtab);
             for (id, s) in handlers {
                 gen.mark_label(
                     *situation_labs
@@ -1386,16 +1386,12 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
             load(gen, titem);
             gen.emit(OpCode::BrFalse(else_lab));
             symtab.enter();
-            for stmt in cons {
-                compile_stmt(stmt, gen, symtab);
-            }
+            compile_stmt(cons, gen, symtab);
             gen.emit(OpCode::Br(end_lab));
             symtab.exit();
             symtab.enter();
             gen.mark_label(else_lab);
-            for stmt in alt {
-                compile_stmt(stmt, gen, symtab);
-            }
+            compile_stmt(alt, gen, symtab);
             gen.mark_label(end_lab);
             symtab.exit();
         }
@@ -1403,15 +1399,11 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
             let loop_lab = gen.new_label();
             let end_lab = gen.new_label();
             gen.mark_label(loop_lab);
-            for stmt in s {
-                compile_stmt(stmt, gen, symtab);
-            }
+            compile_stmt(s, gen, symtab);
             let titem = compile_expr(test, gen, symtab);
             load(gen, titem);
             gen.emit(OpCode::BrFalse(end_lab));
-            for stmt in t {
-                compile_stmt(stmt, gen, symtab);
-            }
+            compile_stmt(t, gen, symtab);
             gen.emit(OpCode::Br(loop_lab));
             gen.mark_label(end_lab);
         }
@@ -1427,9 +1419,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
             }
             symtab.enter();
             gen.mark_label(loop_lab);
-            for stmt in s {
-                compile_stmt(stmt, gen, symtab);
-            }
+            compile_stmt(s, gen, symtab);
             gen.emit(OpCode::Br(loop_lab));
             for (id, s) in handlers {
                 gen.mark_label(
@@ -1459,9 +1449,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
             let titem = compile_expr(test, gen, symtab);
             load(gen, titem);
             gen.emit(OpCode::BrFalse(alt_labs[next_lab_idx]));
-            for stmt in s {
-                compile_stmt(stmt, gen, symtab);
-            }
+            compile_stmt(s, gen, symtab);
             gen.emit(OpCode::Br(loop_lab));
             symtab.exit();
 
@@ -1472,9 +1460,7 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
                 let titem = compile_expr(atest, gen, symtab);
                 load(gen, titem);
                 gen.emit(OpCode::BrFalse(end_lab));
-                for stmt in ablock {
-                    compile_stmt(stmt, gen, symtab);
-                }
+                compile_stmt(ablock, gen, symtab);
                 gen.emit(OpCode::Br(loop_lab));
                 symtab.exit();
             }
