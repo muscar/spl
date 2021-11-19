@@ -41,7 +41,6 @@ enum Stmt {
     Skip,
     Expr(Expr),
     Block(Block),
-    Assign(Expr, Expr),
     Decls(Vec<Decl>),
     IfThenElse(Expr, Box<Stmt>, Box<Stmt>),
     BeginUntil(Vec<Ident>, Box<Stmt>, Vec<(Ident, Stmt)>),
@@ -57,6 +56,7 @@ enum Expr {
     ArrayLit(Vec<Expr>),
     Ident(Ident),
     Subscript(Box<Expr>, Box<Expr>),
+    Assign(Box<Expr>, Box<Expr>),
     UnOp(UnOp, Box<Expr>),
     BinOp(BinOp, Box<Expr>, Box<Expr>),
 }
@@ -495,13 +495,7 @@ impl<'a> Parser<'a> {
             Some(tok) if tok.kind == TokenKind::KwIf => self.if_then_else(),
             Some(tok) if tok.kind == TokenKind::KwLoop => self.loop_dispatch(),
             Some(tok) if tok.kind == TokenKind::KwWhile => self.while_else_if(),
-            _ => {
-                let lhs = self.expr();
-                if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
-                    return self.assignment(lhs);
-                }
-                Stmt::Expr(lhs)
-            }
+            _ => Stmt::Expr(self.expr()),
         }
     }
 
@@ -647,13 +641,17 @@ impl<'a> Parser<'a> {
         Stmt::IfThenElse(test, Box::new(cons), Box::new(alt))
     }
 
-    fn assignment(&mut self, lhs: Expr) -> Stmt {
-        self.expect(TokenKind::Becomes);
-        let rhs = self.expr();
-        Stmt::Assign(lhs, rhs)
+    fn expr(&mut self) -> Expr {
+        let lhs = self.rel_expr();
+        if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
+            self.tokens.next();
+            let rhs = self.rel_expr();
+            return Expr::Assign(Box::new(lhs), Box::new(rhs));
+        }
+        lhs
     }
 
-    fn expr(&mut self) -> Expr {
+    fn rel_expr(&mut self) -> Expr {
         let mut lhs = self.simple_expr();
         while matches!(
             self.tokens.peek(),
@@ -920,22 +918,6 @@ fn type_check_stmt(ty_env: &mut TypeEnv, stmt: &Stmt) {
             }
             ty_env.exit();
         }
-        Stmt::Assign(lhs, rhs) => {
-            let lty = type_of_expr(ty_env, lhs);
-            let rty = type_of_expr(ty_env, rhs);
-            match (&lty, &rty) {
-                (Type::Array(sty1, Some(len1)), Type::Array(sty2, Some(len2))) => {
-                    if sty1 != sty2 || len2 > len1 {
-                        panic!("type error: trying to assign {:?} to {:?}", rty, lty);
-                    }
-                }
-                (ty1, ty2) => {
-                    if ty1 != ty2 {
-                        panic!("type error: trying to assign {:?} to {:?}", rty, lty);
-                    }
-                }
-            };
-        }
         Stmt::IfThenElse(test, s, t) | Stmt::LoopWhile(s, test, t) => {
             let tty = type_of_expr(ty_env, test);
             if tty != Type::Boolean {
@@ -1027,6 +1009,23 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
                 }
             }
         }
+        Expr::Assign(lhs, rhs) => {
+            let lty = type_of_expr(ty_env, lhs);
+            let rty = type_of_expr(ty_env, rhs);
+            match (&lty, &rty) {
+                (Type::Array(sty1, Some(len1)), Type::Array(sty2, Some(len2))) => {
+                    if sty1 != sty2 || len2 > len1 {
+                        panic!("type error: trying to assign {:?} to {:?}", rty, lty);
+                    }
+                }
+                (ty1, ty2) => {
+                    if ty1 != ty2 {
+                        panic!("type error: trying to assign {:?} to {:?}", rty, lty);
+                    }
+                }
+            };
+            lty
+        }
         Expr::BinOp(op, lhs, rhs) => {
             let lty = type_of_expr(ty_env, lhs);
             let rty = type_of_expr(ty_env, rhs);
@@ -1070,6 +1069,8 @@ struct LabelIdx(usize);
 
 #[derive(Clone, Copy)]
 enum OpCode {
+    Dup,
+    Pop,
     LdcI8(i64),
     LdLoc(LocalIdx),
     StLoc(LocalIdx),
@@ -1091,6 +1092,8 @@ enum OpCode {
 impl Display for OpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            OpCode::Dup => f.write_str("dup"),
+            OpCode::Pop => f.write_str("pop"),
             OpCode::LdcI8(n) => f.write_fmt(format_args!("ldc.i8 {}", n)),
             OpCode::LdLoc(idx) => f.write_fmt(format_args!("ldloc {}", idx.0)),
             OpCode::StLoc(idx) => f.write_fmt(format_args!("stloc {}", idx.0)),
@@ -1200,6 +1203,15 @@ impl Vm {
         let mut ip = 0;
         while ip < gen.code.len() {
             match gen.code[ip] {
+                OpCode::Dup => {
+                    let x = self.stack.last().expect("stack underflow").clone();
+                    self.stack.push(x);
+                    ip += 1;
+                }
+                OpCode::Pop => {
+                    self.stack.pop().expect("stack underflow");
+                    ip += 1;
+                }
                 OpCode::LdcI8(n) => {
                     self.stack.push(n);
                     ip += 1;
@@ -1359,6 +1371,17 @@ fn compile_decl(decl: &Decl, gen: &mut CodeBlock, symtab: &mut SymTab) {
     }
 }
 
+fn compile_block(block: &Block, gen: &mut CodeBlock, symtab: &mut SymTab) {
+    symtab.enter();
+    for s in &block.body {
+        compile_stmt(s, gen, symtab);
+    }
+    if block.discard_value {
+        gen.emit(OpCode::Pop);
+    }
+    symtab.exit();
+}
+
 fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
     match stmt {
         Stmt::Skip => gen.emit(OpCode::Nop),
@@ -1366,32 +1389,12 @@ fn compile_stmt(stmt: &Stmt, gen: &mut CodeBlock, symtab: &mut SymTab) {
             let item = compile_expr(e, gen, symtab);
             load(gen, item);
         }
-        // TODO: array assignment
-        Stmt::Assign(lhs, rhs) => match compile_expr(lhs, gen, symtab) {
-            Item::Imm(_) | Item::Stack => panic!("trying to assign to value on stack! bug?"),
-            Item::Local(idx) => {
-                let item = compile_expr(rhs, gen, symtab);
-                load(gen, item);
-                gen.emit(OpCode::StLoc(idx));
-            }
-            Item::ArrayElem(_) => {
-                let item = compile_expr(rhs, gen, symtab);
-                load(gen, item);
-                gen.emit(OpCode::StElem);
-            }
-        },
         Stmt::Decls(decls) => {
             for d in decls {
                 compile_decl(d, gen, symtab);
             }
         }
-        Stmt::Block(body) => {
-            symtab.enter();
-            for s in &body.body {
-                compile_stmt(s, gen, symtab);
-            }
-            symtab.exit();
-        }
+        Stmt::Block(body) => compile_block(body, gen, symtab),
         Stmt::BeginUntil(situations, s, handlers) => {
             symtab.enter();
             let end_lab = gen.new_label();
@@ -1570,6 +1573,24 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
             gen.mark_label(end_lab);
             Item::Stack
         }
+        // TODO: array assignment
+        Expr::Assign(lhs, rhs) => match compile_expr(lhs, gen, symtab) {
+            Item::Imm(_) | Item::Stack => panic!("trying to assign to value on stack! bug?"),
+            Item::Local(idx) => {
+                let item = compile_expr(rhs, gen, symtab);
+                load(gen, item);
+                gen.emit(OpCode::Dup);
+                gen.emit(OpCode::StLoc(idx));
+                Item::Stack
+            }
+            Item::ArrayElem(_) => {
+                let item = compile_expr(rhs, gen, symtab);
+                load(gen, item);
+                gen.emit(OpCode::Dup);
+                gen.emit(OpCode::StElem);
+                Item::Stack
+            }
+        },
         Expr::BinOp(BinOp::LogicOr, lhs, rhs) => {
             let else_lab = gen.new_label();
             let false_lab = gen.new_label();
