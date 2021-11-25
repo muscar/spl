@@ -468,9 +468,7 @@ impl<'a> Parser<'a> {
         // TODO: contains() is slow
         while matches!(self.tokens.peek(), Some(tok) if !end_toks.contains(&tok.kind)) {
             body.push(self.statement());
-            if !matches!(self.tokens.peek
-                (), Some(tok) if tok.kind == TokenKind::Semicolon)
-            {
+            if !matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Semicolon) {
                 discard_value = false;
                 break;
             }
@@ -645,7 +643,7 @@ impl<'a> Parser<'a> {
         let lhs = self.rel_expr();
         if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::Becomes) {
             self.tokens.next();
-            let rhs = self.rel_expr();
+            let rhs = self.expr();
             return Expr::Assign(Box::new(lhs), Box::new(rhs));
         }
         lhs
@@ -861,20 +859,30 @@ fn type_check_decl(ty_env: &mut TypeEnv, decl: &Decl) {
         Decl::Var(name, ty_annot, init_expr) => {
             let var_ty = ty_annot.as_ref().map(resolve_type_annot);
             let init_expr_ty = init_expr.as_ref().map(|e| type_of_expr(ty_env, e));
-            let ty = match (var_ty, init_expr_ty) {
-                (Some(Type::Array(sty1, Some(len1))), Some(Type::Array(sty2, Some(len2)))) => {
+            let ty = match (&var_ty, &init_expr_ty) {
+                (Some(ty @ Type::Array(sty1, Some(len1))), Some(Type::Array(sty2, Some(len2)))) => {
+                    if *len1 <= 0 {
+                        panic!("arrays must positive sizes");
+                    }
                     if sty1 != sty2 || len2 > len1 {
                         panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", name.0);
                     }
-                    Type::Array(sty1, Some(len1))
+                    ty.clone()
                 }
                 (Some(ty1), Some(ty2)) => {
                     if ty1 != ty2 {
                         panic!("type error: the type initialiser for variable `{}' doesn't match its type annotation", name.0);
                     }
-                    ty1
+                    ty1.clone()
                 }
-                (Some(ty), None) | (None, Some(ty)) => ty,
+                (Some(ty @ Type::Array(_, Some(len))), None)
+                | (None, Some(ty @ Type::Array(_, Some(len)))) => {
+                    if *len <= 0 {
+                        panic!("arrays must positive sizes");
+                    }
+                    ty.clone()
+                }
+                (Some(ty), None) | (None, Some(ty)) => ty.clone(),
                 (None, None) => {
                     panic!("type error: a variable introduced by `let' must have an initialiser")
                 }
