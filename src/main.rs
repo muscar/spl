@@ -3,8 +3,10 @@ use std::{
     env,
     fmt::Display,
     fs,
+    hash::Hash,
     io::{self, Write},
     iter::Peekable,
+    panic,
     str::Chars,
 };
 
@@ -16,7 +18,7 @@ struct Ident(String);
 #[derive(Debug, Clone)]
 enum TypeAnnot {
     TypeName(String),
-    Array(Box<TypeAnnot>, usize),
+    Array(Box<TypeAnnot>, Option<usize>),
 }
 
 #[derive(Debug)]
@@ -53,6 +55,7 @@ enum Stmt {
 enum Expr {
     BoolLit(bool),
     IntLit(i64),
+    StrLit(String),
     ArrayLit(Vec<Expr>),
     Ident(Ident),
     Subscript(Box<Expr>, Box<Expr>),
@@ -87,6 +90,7 @@ enum BinOp {
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum TokenKind {
     IntLit,
+    StrLit,
     Ident,
     Plus,
     Minus,
@@ -131,6 +135,7 @@ enum TokenKind {
     KwRepeat,
     KwUntil,
     KwSkip,
+    KwWriteStr,
     Unknown,
     Eof,
 }
@@ -303,6 +308,16 @@ impl<'a> Iterator for Tokens<'a> {
                 token.text.push(self.reader.read().unwrap());
                 TokenKind::RBrack
             }
+            Some('"') => {
+                self.reader.read().unwrap();
+                while matches!(self.reader.peek(), Some(c) if c != '"') {
+                    token.text.push(self.reader.read().unwrap());
+                }
+                if !matches!(self.reader.peek(), Some(c) if c == '"') {
+                    panic!("lexical error: missing closing double quote for string literal");
+                }
+                TokenKind::StrLit
+            }
             Some(c) if c.is_digit(10) => {
                 while matches!(self.reader.peek(), Some(c) if c.is_digit(10)) {
                     token.text.push(self.reader.read().unwrap());
@@ -365,6 +380,7 @@ impl<'a> Scanner<'a> {
         keywords.insert("or", TokenKind::KwOr);
         keywords.insert("true", TokenKind::KwTrue);
         keywords.insert("false", TokenKind::KwFalse);
+        keywords.insert("writestr", TokenKind::KwWriteStr);
         Tokens::new(&mut self.reader, keywords)
     }
 }
@@ -436,7 +452,7 @@ impl<'a> Parser<'a> {
                 ..
             }) => {
                 self.tokens.next();
-                TypeAnnot::Array(Box::new(ty_name), 0)
+                TypeAnnot::Array(Box::new(ty_name), None)
             }
             _ => ty_name,
         }
@@ -537,10 +553,20 @@ impl<'a> Parser<'a> {
         let name = self.ident();
         if let Some(TypeAnnot::Array(base_type, _)) = ty_annot {
             self.expect(TokenKind::LBrack);
-            let dim = self
-                .expect(TokenKind::IntLit)
-                .parse()
-                .expect("array dimensions must be integer literals");
+            let dim = match self.tokens.next() {
+                Some(Token {
+                    kind: TokenKind::IntLit,
+                    text,
+                }) => Some(
+                    text.parse()
+                        .expect("array dimensions must be integer literals"),
+                ),
+                Some(Token {
+                    kind: TokenKind::Star,
+                    ..
+                }) => None,
+                _ => panic!("array dimension must be integral constant or `*'"),
+            };
             ty_annot = Some(TypeAnnot::Array(base_type, dim));
             self.expect(TokenKind::RBrack);
         }
@@ -749,6 +775,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwTrue => Expr::BoolLit(true),
             TokenKind::KwFalse => Expr::BoolLit(false),
             TokenKind::IntLit => Expr::IntLit(tok.text.parse().expect("malformed integer literal")),
+            TokenKind::StrLit => Expr::StrLit(tok.text),
             TokenKind::Ident => {
                 let id = Expr::Ident(Ident(tok.text));
                 if matches!(self.tokens.peek(), Some(tok) if tok.kind == TokenKind::LBrack) {
@@ -836,7 +863,7 @@ fn resolve_type_annot(name: &TypeAnnot) -> Type {
     match name {
         TypeAnnot::TypeName(ty_name) => resolve_type(&ty_name[..]),
         TypeAnnot::Array(base_ty, size) => {
-            Type::Array(Box::new(resolve_type_annot(base_ty)), Some(*size))
+            Type::Array(Box::new(resolve_type_annot(base_ty)), *size)
         }
     }
 }
@@ -978,6 +1005,7 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
     match expr {
         Expr::BoolLit(_) => Type::Boolean,
         Expr::IntLit(_) => Type::Integer,
+        Expr::StrLit(_) => Type::String,
         Expr::ArrayLit(es) => {
             if es.is_empty() {
                 panic!("type error: can't determine the base type of an empty array literal");
@@ -1070,6 +1098,9 @@ fn type_of_expr(ty_env: &TypeEnv, expr: &Expr) -> Type {
 // Compiler + VM
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StrIdx(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LocalIdx(usize);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1080,6 +1111,7 @@ enum OpCode {
     Dup,
     Pop,
     LdcI8(i64),
+    LdcStr(StrIdx),
     LdLoc(LocalIdx),
     StLoc(LocalIdx),
     LdElem,
@@ -1094,6 +1126,7 @@ enum OpCode {
     Gt,
     Br(LabelIdx),
     BrFalse(LabelIdx),
+    WriteStr,
     Nop,
 }
 
@@ -1103,10 +1136,11 @@ impl Display for OpCode {
             OpCode::Dup => f.write_str("dup"),
             OpCode::Pop => f.write_str("pop"),
             OpCode::LdcI8(n) => f.write_fmt(format_args!("ldc.i8 {}", n)),
-            OpCode::LdLoc(idx) => f.write_fmt(format_args!("ldloc {}", idx.0)),
-            OpCode::StLoc(idx) => f.write_fmt(format_args!("stloc {}", idx.0)),
-            OpCode::LdElem => f.write_fmt(format_args!("ldelem")),
-            OpCode::StElem => f.write_fmt(format_args!("stelem")),
+            OpCode::LdcStr(idx) => f.write_fmt(format_args!("ldc.str {}", idx.0)),
+            OpCode::LdLoc(idx) => f.write_fmt(format_args!("ld.loc {}", idx.0)),
+            OpCode::StLoc(idx) => f.write_fmt(format_args!("st.loc {}", idx.0)),
+            OpCode::LdElem => f.write_fmt(format_args!("ld.elem")),
+            OpCode::StElem => f.write_fmt(format_args!("st.elem")),
             OpCode::Not => f.write_str("not"),
             OpCode::Add => f.write_str("add"),
             OpCode::Sub => f.write_str("sub"),
@@ -1117,6 +1151,7 @@ impl Display for OpCode {
             OpCode::Gt => f.write_str("gt"),
             OpCode::Br(lab) => f.write_fmt(format_args!("br {}", lab.0)),
             OpCode::BrFalse(lab) => f.write_fmt(format_args!("br.false {}", lab.0)),
+            OpCode::WriteStr => f.write_str("write.str"),
             OpCode::Nop => f.write_str("nop"),
         }
     }
@@ -1124,6 +1159,8 @@ impl Display for OpCode {
 
 struct CodeBlock {
     code: Vec<OpCode>,
+    str_pool: Vec<String>,
+    str_map: HashMap<String, StrIdx>,
     labels: HashMap<LabelIdx, usize>,
     next_local_idx: usize,
     next_label_idx: usize,
@@ -1133,9 +1170,22 @@ impl CodeBlock {
     fn new() -> Self {
         Self {
             code: Vec::new(),
+            str_pool: Vec::new(),
+            str_map: HashMap::new(),
             labels: HashMap::new(),
             next_local_idx: 0,
             next_label_idx: 0,
+        }
+    }
+
+    fn intern_string(&mut self, s: &str) -> StrIdx {
+        match self.str_map.get(s) {
+            Some(idx) => *idx,
+            None => {
+                let idx = StrIdx(self.str_pool.len());
+                self.str_pool.push(s.to_owned());
+                idx
+            }
         }
     }
 
@@ -1224,6 +1274,11 @@ impl Vm {
                     self.stack.push(n);
                     ip += 1;
                 }
+                OpCode::LdcStr(idx) => {
+                    // TODO hacky pointers
+                    self.stack.push(idx.0 as i64);
+                    ip += 1;
+                }
                 OpCode::LdLoc(idx) => {
                     self.stack
                         .push(self.call_stack.last().unwrap().locals[idx.0]);
@@ -1305,6 +1360,11 @@ impl Vm {
                         ip += 1;
                     }
                 }
+                OpCode::WriteStr => {
+                    let idx = self.stack.pop().expect("stack underflow");
+                    println!("{}", gen.str_pool[idx as usize]);
+                    ip += 1;
+                }
                 OpCode::Nop => ip += 1,
             }
         }
@@ -1316,7 +1376,7 @@ impl Vm {
 #[derive(PartialEq, Eq, Clone, Hash)]
 enum Symbol {
     Local(LocalIdx),
-    LocalArray(LocalIdx, usize),
+    LocalArray(LocalIdx, Option<usize>),
     Situation(LabelIdx),
 }
 
@@ -1326,8 +1386,9 @@ type SymTab = Env<Symbol>;
 enum Item {
     Stack,
     Imm(i64),
+    Str(StrIdx),
     Local(LocalIdx),
-    ArrayElem(LocalIdx),
+    ArrayElem(LocalIdx, Option<usize>),
 }
 
 fn compile(prog: &Program, gen: &mut CodeBlock) {
@@ -1336,7 +1397,7 @@ fn compile(prog: &Program, gen: &mut CodeBlock) {
     // TODO: gross hack
     symtab.insert(
         Ident("ARGS".to_string()),
-        Symbol::LocalArray(LocalIdx(0), 0),
+        Symbol::LocalArray(LocalIdx(0), None),
     );
     compile_stmt(&prog.body, gen, &mut symtab);
     symtab.exit();
@@ -1346,11 +1407,12 @@ fn compile_decl(decl: &Decl, gen: &mut CodeBlock, symtab: &mut SymTab) {
     match decl {
         Decl::Var(name, ty_annot, init_expr) => {
             let idx = match ty_annot {
-                Some(TypeAnnot::Array(_, dim)) => {
-                    let idx = gen.add_local(*dim);
-                    symtab.insert(name.clone(), Symbol::LocalArray(idx, *dim));
+                Some(TypeAnnot::Array(_, Some(size))) => {
+                    let idx = gen.add_local(*size);
+                    symtab.insert(name.clone(), Symbol::LocalArray(idx, Some(*size)));
                     idx
                 }
+                Some(TypeAnnot::Array(_, None)) => todo!("open arrays"),
                 _ => {
                     let idx = gen.add_local(1);
                     symtab.insert(name.clone(), Symbol::Local(idx));
@@ -1520,6 +1582,7 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
     match expr {
         Expr::BoolLit(b) => Item::Imm(if *b { 1 } else { 0 }),
         Expr::IntLit(n) => Item::Imm(*n),
+        Expr::StrLit(s) => Item::Str(gen.intern_string(&s)),
         Expr::ArrayLit(_) => Item::Stack,
         Expr::Ident(id) => {
             let sym = symtab
@@ -1527,7 +1590,7 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
                 .unwrap_or_else(|| panic!("unbound identifier: {}", id.0));
             match sym {
                 Symbol::Local(idx) => Item::Local(*idx),
-                Symbol::LocalArray(idx, _) => Item::ArrayElem(*idx),
+                Symbol::LocalArray(idx, size) => Item::ArrayElem(*idx, *size),
                 Symbol::Situation(lab) => {
                     gen.emit(OpCode::Br(*lab));
                     // TODO: Is this right?
@@ -1539,10 +1602,18 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
             let titem = compile_expr(target, gen, symtab);
             let sitem = compile_expr(sub, gen, symtab);
             match (titem, sitem) {
-                (Item::ArrayElem(base_off), Item::Imm(idx)) => {
+                (Item::ArrayElem(base_off, Some(size)), Item::Imm(idx)) => {
+                    if idx < 0 || idx as usize >= size {
+                        panic!("subscript out of bounds");
+                    }
                     Item::Local(LocalIdx(base_off.0 + idx as usize))
                 }
-                (Item::ArrayElem(base_off), _) => {
+                (Item::ArrayElem(base_off, None), Item::Imm(idx)) => {
+                    // TODO: bounds check
+                    Item::Local(LocalIdx(base_off.0 + idx as usize))
+                }
+                (Item::ArrayElem(base_off, _size), _) => {
+                    // TODO: bounds check
                     load(gen, sitem);
                     gen.emit(OpCode::LdcI8(base_off.0 as i64));
                     titem
@@ -1584,6 +1655,7 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
         // TODO: array assignment
         Expr::Assign(lhs, rhs) => match compile_expr(lhs, gen, symtab) {
             Item::Imm(_) | Item::Stack => panic!("trying to assign to value on stack! bug?"),
+            Item::Str(_) => todo!("string assignment"),
             Item::Local(idx) => {
                 let item = compile_expr(rhs, gen, symtab);
                 load(gen, item);
@@ -1591,7 +1663,7 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
                 gen.emit(OpCode::StLoc(idx));
                 Item::Stack
             }
-            Item::ArrayElem(_) => {
+            Item::ArrayElem(_, _) => {
                 let item = compile_expr(rhs, gen, symtab);
                 load(gen, item);
                 gen.emit(OpCode::Dup);
@@ -1672,8 +1744,10 @@ fn compile_expr(expr: &Expr, gen: &mut CodeBlock, symtab: &SymTab) -> Item {
 fn load(gen: &mut CodeBlock, item: Item) {
     match item {
         Item::Imm(n) => gen.emit(OpCode::LdcI8(n)),
+        Item::Str(idx) => gen.emit(OpCode::LdcStr(idx)),
         Item::Local(idx) => gen.emit(OpCode::LdLoc(idx)),
-        Item::ArrayElem(_) => {
+        Item::ArrayElem(_, _) => {
+            // TODO: bounds check?
             gen.emit(OpCode::LdElem);
         }
         Item::Stack => (),
